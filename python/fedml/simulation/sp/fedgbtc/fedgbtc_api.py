@@ -1,28 +1,45 @@
 import copy
 import logging
-import math
 import random
 from collections import OrderedDict
-
+from scipy.stats import lognorm
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import wandb
 from fedml import mlops
 from fedml.ml.trainer.trainer_creator import create_model_trainer
-
 from .client import Client
 import openpyxl
 import time
 
-global_client_num_in_total = 60
-global_client_num_per_round = 30
+
+# 常超参数
+interval_params = {
+    'N': (20, 30),
+    'D': (200, 1600),
+    'miu': (15, 20),
+    'P': (0.5, 1),
+    'F': (0.05, 0.4),
+    'Z': -114,
+    'B': 10,
+    'delta': 6272,
+    'M': 3.4*10**6,
+    'sigma': 1,
+    'rho': 8,
+    'I': 5,
+    'lr': 0.01,
+    'e': 1e-28,
+    'd': (0, 100),
+    'k': 10
+}
+quality_weights = {'cpu': 0.25, 'ram': 0.25, 'bm': 0.25, 'q': 0.25}
 
 accuracy_list = []
 loss_list = []
 k_list = []
 # 参数0
 # 统计global_client_num_in_total个客户每个人的被选择次数
-client_selected_times = [0 for i in range(global_client_num_in_total)]
 plt.figure(1, figsize=(16, 4))
 
 # 创建一个新的Excel工作簿
@@ -41,6 +58,40 @@ bid_quality_ws = wb.create_sheet('Bid and Quality Info')
 bid_quality_ws.append(['Round', 'ClientIdx', 'Bid', 'Quality Score'])
 # 设置时间间隔（以秒为单位）
 interval = 5
+
+
+class AutoIncrementDict:
+    def __init__(self):
+        self._data = {}
+        self._next_id = 0
+    def add(self, value):
+        self._data[self._next_id] = value
+        current_id = self._next_id
+        self._next_id += 1
+        return current_id
+    def remove(self, key):
+        if key in self._data:
+            del self._data[key]
+    def get(self, key):
+        return self._data.get(key, None)
+    def __getitem__(self, key):
+        return self.get(key)
+    def __delitem__(self, key):
+        self.remove(key)
+    def __repr__(self):
+        return repr(self._data)
+    def items(self):
+        return self._data.items()
+    def keys(self):
+        return self._data.keys()
+    def values(self):
+        return self._data.values()
+    def remove_empty_values(self):
+        keys_to_remove = [key for key, value in self._data.items() if not value]
+        for key in keys_to_remove:
+            del self._data[key]
+
+
 
 class FedGBTCAPI(object):   #变量参考FARA代码
     def __init__(self, args, device, dataset, model):
@@ -63,14 +114,21 @@ class FedGBTCAPI(object):   #变量参考FARA代码
         self.train_data_num_in_total = train_data_num
         self.test_data_num_in_total = test_data_num
         self.class_num = class_num
-        self.args.client_num_in_total = global_client_num_in_total # added
-        self.client_list = []
-        self.banned_client_indexs = []
-        self.client_quility_list = []
+        self.client_num_in_total = np.random.randint(interval_params['N'])
+        self.client_list = []  # 原始的客户集合（全部），不以联盟区分
         self.train_data_local_num_dict = train_data_local_num_dict
         self.train_data_local_dict = train_data_local_dict
         self.test_data_local_dict = test_data_local_dict
-
+        # 乐享联盟参数
+        self.k = interval_params['k']
+        self.quality_weights = quality_weights
+        self.client_params = {i: {} for i in range(self.client_num_in_total)}  # 存储每个客户的交互参数
+        self.client_quality_list = {i: {'cpu': 0, 'ram': 0, 'bm': 0, 'q': 0} for i in range(self.client_num_in_total)}  # 存储客户的质量属性（每轮博弈结束后会更新）
+        self.trust_matrix = self.create_trust_graph()  # 初始化直接生成信任矩阵，全局静态
+        self.client_unions = {}   # 联盟结构（可能包含多个联盟，键为联盟主的id，值为联盟成员的id集合，暂不考虑联盟结构的变化）
+        self.his_client_unions = {i: {} for i in range(self.client_num_in_total)}  # 历史联盟(客户历史所参与的,还没有盟主，字典存放联盟的id-客户对其偏好值)
+        # 第二阶段博弈参数
+        # 第一阶段博弈参数
         logging.info("model = {}".format(model))
         self.model_trainer = create_model_trainer(model, args)
         self.model = model
@@ -80,12 +138,142 @@ class FedGBTCAPI(object):   #变量参考FARA代码
             train_data_local_num_dict, train_data_local_dict, test_data_local_dict, self.model_trainer,
         )
 
-    def _setup_clients(
-            self, train_data_local_num_dict, train_data_local_dict, test_data_local_dict, model_trainer,
-    ):
+
+    def params_generator(self):
+        for key, value in interval_params.items():
+            if key == 'sigma':
+                rl = np.random.rayleigh(scale=value, size=self.client_num_in_total)
+                for i, sigma_i in enumerate(rl):
+                    self.client_params[i]['sigma'] = sigma_i
+            elif key == 'rho':
+                ln = lognorm(s=value, scale=self.client_num_in_total)
+                for i, rho_i in enumerate(ln.rvs()):
+                    self.client_params[i]['rho'] = rho_i
+            if value.type == 'tuple':
+                for i in range(self.client_num_in_total):
+                    self.client_params[key] = np.random.rand(value)
+
+    def create_trust_graph(self, value_range=(1, 10), distrust_probability=0.1):
+        """
+        修改后的函数，以一定的概率生成表示完全不信任的负无穷值。
+        :param client_num_in_total: 客户总数，决定了信任图的大小
+        :param value_range: 信任值的范围，为(min_value, max_value)
+        :param distrust_probability: 完全不信任的概率
+        :return: 带有表示不信任关系的随机信任图
+        """
+        shape = (self.client_num_in_total, self.client_num_in_total)
+        min_value, max_value = value_range
+        # 生成随机信任值数组
+        trust_array = np.random.rand(*shape) * (max_value - min_value) + min_value
+        # 以一定概率设置某些信任值为负无穷，表示完全不信任
+        distrust_mask = np.random.rand(*shape) < distrust_probability
+        trust_array[distrust_mask] = -np.inf
+        return trust_array
+
+    def upgrade_union_uid(self, union, uid_old, uid_new, nid=None):  # 新旧联盟的交替(通常发生在某客户离开/加入某联盟)
+        for cid in union:  # 这里可选则将新增客户id传入,避免删除旧联盟id记录的操作
+            if cid != nid:
+                self.his_client_unions[cid].remove(uid_old)
+            self.his_client_unions[cid][uid_new] = self.cal_preference(cid, union)
+    def unions_formation(self):
+        """
+        生成初始联盟划分，同时避免联盟中存在信任值为负无穷的客户关系。
+        """
+        customer_ids = np.arange(self.client_num_in_total)
+        np.random.shuffle(customer_ids)
+        unions = AutoIncrementDict()
+        # 初始化联盟字典（自动计数id）
+        for customer_id in customer_ids:
+            added = False
+            for uid, members in unions.items():
+                can_add = True
+                for member in members:
+                    if self.trust_matrix[customer_id, member] == -np.inf or self.trust_matrix[member, customer_id] == -np.inf:
+                        can_add = False
+                        break
+                if can_add:
+                    unions[uid].append(customer_id)
+                    self.his_client_unions[customer_id].append(uid)
+                    added = True
+                    break
+            if not added:
+                new_uid = unions.add([customer_id])
+                self.his_client_unions[customer_id].append(new_uid)
+        unions.remove_empty_values() # 清除空联盟
+
+        stable = False
+        while not stable:
+            stable = True  # 假设本轮次不再发生联盟变化
+            for cid in range(self.client_num_in_total):  # 遍历每一位客户,初始将目前定义为最优
+                uid_i = next(reversed(self.his_client_unions[cid].keys()))   # 找到当前客户i所在的联盟id
+                best_pre_i = self.cal_preference(cid, unions[uid_i])  #
+                best_uid_i = uid_i
+                for uid, union in unions.items():
+                    if uid == best_uid_i:  # 避免重新评估当前联盟
+                        continue
+                    else:
+                        pre = self.cal_preference(cid, union)  # 计算客户对该联盟的偏好值
+                        if pre > best_pre_i:
+                            best_pre_i = pre
+                            best_uid_i = uid
+                            stable = False  # 如果发生了联盟变化，则本轮次不再稳定
+
+                if best_uid_i != uid_i:  # 如果找到了更好的联盟,双更新,也要更新原来两个联盟中客户绑定的uid
+                    # 更新旧联盟
+                    union_former = unions[uid_i]
+                    union_former.remove(cid)
+                    unions.remove(uid_i)
+                    new_uid_former = unions.add(union_former)
+                    self.upgrade_union_uid(union_former, uid_i, new_uid_former)
+                    # 更新新联盟
+                    union_latter = unions[best_uid_i]
+                    unions.remove(best_uid_i)
+                    union_latter.append(cid)
+                    new_uid_latter = unions.add(union_latter)
+                    self.his_client_unions[cid].remove(uid_i)
+                    self.upgrade_union_uid(union_latter, best_uid_i, new_uid_latter, cid)
+                unions.remove_empty_values() # 清除空联盟
+        # 返回稳定的联盟
+        return unions
+
+    def cal_client_quality(self, cid):  # 计算客户i的加权质量属性值
+        score = 0.0
+        for key, value in self.client_quality_list[cid].items():
+            score += value * self.quality_weights[key]
+        return score
+    def cm_election(self, unions):  # 联盟主选举算法
+        for uid, union in unions.items():
+            best_score = -np.inf
+            best_cid = -1
+            for cid in union:
+                score = self.cal_client_quality(cid)
+                if score > best_score:
+                    best_score = score
+                    best_cid = cid
+            if best_cid == -1:
+                raise ValueError("No client in the union")
+            # 从联盟中移除联盟主，准备更新联盟成员信息
+            self.client_unions[best_cid] = [cid for cid in union if cid != best_cid]
+
+    def cal_preference(self, i, union): # 客户对联盟的偏好函数,暂时不考虑历史联盟
+        pre = 0.0
+        for j in union:
+            if self.trust_matrix[i][j] == -np.inf:
+                pre = -np.inf
+                break
+            # elif
+            else:
+                pre += self.trust_matrix[i][j]
+        return pre
+
+    def cal_client_train_time(self, ):
+    def cal_client_train_cost(self, ):
+
+    def _setup_clients(self, train_data_local_num_dict,
+                       train_data_local_dict, test_data_local_dict, model_trainer,):
         logging.info("############setup_clients (START)#############")
         # 参数1
-        for client_idx in range(global_client_num_in_total):
+        for client_idx in range(self.client_num_in_total):
             c = Client(
                 client_idx,
                 train_data_local_dict[client_idx],
@@ -96,6 +284,9 @@ class FedGBTCAPI(object):   #变量参考FARA代码
                 model_trainer,
             )
             self.client_list.append(c)
+
+        # 客户交互属性的生成
+        self.params_generator()
         logging.info("############setup_clients (END)#############")
 
     def train(self):
@@ -106,103 +297,47 @@ class FedGBTCAPI(object):   #变量参考FARA代码
         mlops.log_round_info(self.args.comm_round, -1)
 
         for round_idx in range(self.args.comm_round):
-#
-#   享乐联盟形成
-#
-            # 定义局部变量client_list,其元素是从全局的client_list中剔除ban的client
-            client_list = []
-            for client in self.client_list:
-                if client.client_idx not in self.banned_client_indexs:
-                    client_list.append(client)
-
             logging.info("################Communication round : {}".format(round_idx))
+            w_unions = {}  # 暂存联盟主返回的模型，用于全局聚合， 以联盟主id为键
+            g_weights = {}  # 暂存全局聚合的权重，以联盟主id为键
 
-            w_locals = []
-
-            ##################### 联盟
-            client_indexes = []
-            #####################
-
-            for idx, client in enumerate(client_list):
-                # update dataset
-                # 如果idx是client_indexes的一部分，那么就更新这个client的数据集
-                if client.client_idx in client_indexes:
-                    client_idx = client.client_idx
+            # 联盟生成与最优化阶段
+            unions = self.unions_formation()  # 初始联盟划分，并得到最优化的划分
+            self.cm_election(unions)  # 联盟主选举，并得到完整的联盟划分
+            for u_cid, union in self.client_unions.items():
+                w_locals = []  # 暂存联盟内客户端返回的模型
+                u_weights = []  # 暂存联盟内部聚合权重
+                # 联盟主及其联盟成员训练
+                for cid in union+[u_cid]:
+                    client = self.client_list[cid]
                     client.update_local_dataset(
-                        client_idx,
-                        self.train_data_local_dict[client_idx],
-                        self.test_data_local_dict[client_idx],
-                        self.train_data_local_num_dict[client_idx],
-                    )
-
-                    # train on new dataset
+                        self.train_data_local_dict[cid],
+                        self.test_data_local_dict[cid],
+                        self.train_data_local_num_dict[cid]
+                    )  # 加入该成员的聚合权重
+                    u_weights.append(client.local_sample_number)
                     mlops.event("train", event_started=True,
                                 event_value="{}_{}".format(str(round_idx), str(client.client_idx)))
                     w = client.train(copy.deepcopy(w_global))
                     mlops.event("train", event_started=False,
                                 event_value="{}_{}".format(str(round_idx), str(client.client_idx)))
-                    # self.logging.info("local weights = " + str(w))
                     w_locals.append((client.get_sample_number(), copy.deepcopy(w), client.client_idx))
 
-            ##################### 主从博弈求解
+                # 联盟内部聚合
+                mlops.event("agg", event_started=True, event_value="轮次{}_联盟主{}".format(str(round_idx),str(u_cid)))
+                w_unions[u_cid] = self._aggregate(w_locals, u_weights)
+                mlops.event("agg", event_started=True, event_value="轮次{}_联盟主{}".format(str(round_idx),str(u_cid)))
 
-            #####################
-
-            self.banned_client_indexs.append(null)
-            print("ban_list = " + str(self.banned_client_indexs))
+            # 主从博弈求解与支付、带宽分配阶段
 
 
-            x_list = [[] for _ in range(global_client_num_in_total)]
-            # 遍历client_indexes
-            for i in client_indexes:
-                for j in range(self.class_num):
 
-                    this_client = None
-                    this_sample_number = 0
 
-                    for idx, client in enumerate(client_list):
-                        # update dataset
-                        # 如果idx是client_indexes的一部分，那么就更新这个client的数据集
-                        if client.client_idx == i:
-                            this_client = client
-
-                    for (sample_number, _, client_idx) in w_locals:
-                        if client_idx == i:
-                            this_sample_number = sample_number
-
-                    x_list[i].append(
-                        (this_client.get_sample_class_number(j) + 1) / (this_sample_number + self.class_num))
-
-            ##################### 聚合
-
-            remove_index_record = []
-            for i in range(len(w_locals) - 1, k, -1):
-                # 拒绝第index=client_info[i][0]个client参与聚合
-                # print("remove element i : " + str(client_info[i][0]))
-                # 取出client_info[i]的三元组的第1个元素，即client的index
-                client_indexes.remove(client_info[i][0])
-                remove_index_record.append(client_info[i][0])
-            # sort remove_index_record from big to small
-            remove_index_record.sort(reverse=True)
-            # 顺序遍历remove_index_record每个元素
-            for i in remove_index_record:
-                # 移除w_locals第idx个元素
-                # print("w_locals" + str(w_locals))
-                for idx, (sample_number,w,client_idx) in enumerate(w_locals):
-                    if client_idx == i:
-                        eweights.pop(idx)
-                        w_locals.pop(idx)
-            # GBTC_final_indexes展示的是最终被选中的client的index
-            logging.info("GBTC_final_indexes = " + str(client_indexes))
-            # 借助client_selected_times统计global_client_num_in_total个客户每个人的被选择次数
-            for i in client_indexes:
-                client_selected_times[i] += 1
-
-            mlops.event("agg", event_started=True, event_value=str(round_idx))
-            w_global = self._aggregate(w_locals, eweights)
-
+            # 全局聚合
+            mlops.event("agg", event_started=True, event_value="轮次{}_全局".format(str(round_idx)))
+            w_global = self._aggregate(list(w_unions.values()), list(g_weights.values()))
             self.model_trainer.set_model_params(w_global)
-            mlops.event("agg", event_started=False, event_value=str(round_idx))
+            mlops.event("agg", event_started=False, event_value="轮次{}_全局".format(str(round_idx)))
 
             # test results
             # at last round
@@ -218,13 +353,13 @@ class FedGBTCAPI(object):   #变量参考FARA代码
 
             mlops.log_round_info(self.args.comm_round, round_idx)
 
-            round_ws.append([round_idx,
-                                train_loss,
-                                train_acc,
-                                time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
-                                str(client_indexes),
-                                str(client_selected_times),
-                                k])
+            # round_ws.append([round_idx,
+            #                     train_loss,
+            #                     train_acc,
+            #                     time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
+            #                     str(client_indexes),
+            #                     str(client_selected_times),
+            #                     k])
 
             # 保存Excel文件到self.args.excel_save_path+文件名
             wb.save(self.args.excel_save_path + self.args.model + "_[" + self.args.dataset +"]_GBTC_training_results_NIID"+ str(self.args.experiment_niid_level) +".xlsx")
