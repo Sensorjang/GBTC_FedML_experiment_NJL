@@ -253,7 +253,7 @@ class FedFARAAPI(object):
                         if client.client_idx == i:
                             this_client = client
 
-                    for (sample_number, _, client_idx) in w_locals:
+                    for (sample_number, _, client_idx) in w_locals:  # w_locals基本结构：样本量、模型dict、客户id
                         if client_idx == i:
                             this_sample_number = sample_number
 
@@ -271,7 +271,7 @@ class FedFARAAPI(object):
             sum_entropy = sum([(1 - entropy) for entropy in entropy])
             wi = [((1 - entropy) / sum_entropy) for entropy in entropy]
             # print("J\n")
-            # Step 4: 计算每个客户的数据质量得分
+            # Step 4: 计算每个客户的数据质量得分 （数据概率分布的熵权）
             quality_scores = [0 for _ in range(global_client_num_in_total)]
             for i in range(len(w_locals)):
                 quality_score = wi[i] * w_locals[i][0]
