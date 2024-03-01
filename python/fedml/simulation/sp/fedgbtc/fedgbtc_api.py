@@ -31,12 +31,12 @@ interval_params = {
     'batch_size': 10,  # 本地训练批大小
     'lr': 0.01,  # 本地训练学习率
     'e': 1e-28,  # 计算芯片组有效电容参数
-    'd': (0, 100),  # 客户端与联邦服务器的物理距离/km
+    'd': (0, 0.08),  # 客户端与联邦服务器的物理距离/km
     'k': 10,  # 初始联盟的个数
-    'omega': 0.5,  # 联盟主对支付成本与训练时间的权衡系数,
-    'P': 50,  # 每轮每联盟总的支付
+    'omega': 900,  # 联盟主对支付成本与训练时间的权衡系数,
     'lambda_cm': (1, 2),  # 客户单位通信开销范围
     'lambda_cp': (1, 2),  # 客户单位计算开销范围
+    'trust_threshold': 0.5,  # 联盟信任阈值（低于阈值的剔除）
 }
 quality_weights = {'cpu': 0.25, 'ram': 0.25, 'bm': 0.25, 'q': 0.25}
 quality_ranges = {'cpu': (1, 5), 'ram': (1, 5), 'bm': (1, 5)}
@@ -128,7 +128,7 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         self.train_data_num_in_total = train_data_num
         self.test_data_num_in_total = test_data_num
         self.class_num = class_num
-        self.client_num_in_total = np.random.randint(interval_params['N'])
+        self.client_num_in_total = np.random.randint(low=interval_params['N'][0], high=interval_params['N'][1] + 1)
         self.client_list = []  # 原始的客户集合（全部），不以联盟区分
         self.train_data_local_num_dict = train_data_local_num_dict
         self.train_data_local_dict = train_data_local_dict
@@ -139,14 +139,17 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         self.client_data_distribution = {i: {} for i in range(self.client_num_in_total)}  # 存储每个客户的数据概率分布
         self.client_params = {i: {} for i in range(self.client_num_in_total)}  # 存储每个客户的交互参数
         self.client_quality_list = {  # 存储客户的特征向量（质量属性）
-            i: {'cpu': np.random.randint(quality_ranges['cpu']), 'ram': np.random.randint(quality_ranges['ram']),
-                'bm': np.random.randint(quality_ranges['bm']), 'q': 0.0} for i in range(self.client_num_in_total)}
-        self.trust_matrix = self.create_trust_graph()  # 初始化直接生成信任矩阵，全局静态
+            i: {'cpu': np.random.randint(low=quality_ranges['cpu'][0], high=quality_ranges['cpu'][1] + 1),
+                'ram': np.random.randint(low=quality_ranges['ram'][0], high=quality_ranges['ram'][1] + 1),
+                'bm': np.random.randint(low=quality_ranges['bm'][0], high=quality_ranges['bm'][1] + 1), 'q': 0.0}
+            for i in range(self.client_num_in_total)}
+        self.trust_matrix = None  # 初始化直接生成信任矩阵，全局静态
         self.client_unions = {}  # 稳定的联盟结构（可能包含多个联盟，键为联盟主的id，值为联盟成员的id集合，暂不考虑联盟结构的变化）
         self.time_unions = {}  # 记录每轮每个稳定联盟的整体训练时间，以盟主id为键
         self.imp_unions = {}  # 记录每个联盟对不同资源的重视程度(元组字典)
         # 历史联盟(客户历史所参与的,还没有盟主，字典存放联盟的id-客户对其偏好值)
         self.his_client_unions = {i: {} for i in range(self.client_num_in_total)}
+        self.client_banned_List = {}  # 存储被剔除的客户（键为id、值为 1. 不成盟 2. 累计信任值不足 3. 均衡解为0）
         self.client_rewards = {}  # 存储每个客户的奖励值
 
         logging.info("model = {}".format(model))
@@ -162,24 +165,31 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         for key, value in interval_params.items():
             if key == 'sigma':
                 rl = np.random.rayleigh(scale=value, size=self.client_num_in_total)
+                print(rl)
                 for i, sigma_i in enumerate(rl):
                     self.client_params[i]['sigma'] = sigma_i
             elif key == 'rho':
-                ln = lognorm(s=value, scale=self.client_num_in_total)
-                for i, rho_i in enumerate(ln.rvs()):
+                ln = lognorm(s=value)
+                for i, rho_i in enumerate(ln.rvs(size=self.client_num_in_total)):
                     self.client_params[i]['rho'] = rho_i
-            elif value.type == 'tuple':
+            elif isinstance(value, tuple) and key != 'N':
                 for i in range(self.client_num_in_total):
-                    self.client_params[key] = np.random.rand(value)
+                    if key == 'D':
+                        self.client_params[i][key] = int(np.random.uniform(*value))
+                    else:
+                        self.client_params[i][key] = np.random.uniform(*value)
             else:
                 self.common_params[key] = value
+        self.args.learning_rate = interval_params['lr']
+        self.args.batch_size = interval_params['batch_size']
+        self.args.epochs = interval_params['I']
 
-    def create_trust_graph(self, value_range=(1, 10), distrust_probability=0.1):
+    def create_trust_graph(self, value_range=(1, 10), distrust_probability=0.01):
         """
-        修改后的函数，以一定的概率生成表示完全不信任的负无穷值。
+        修改后的函数，以一定的概率生成表示完全不信任的负无穷值，并将对角线元素设置为0。
         :param value_range: 信任值的范围，为(min_value, max_value)
         :param distrust_probability: 完全不信任的概率
-        :return: 带有表示不信任关系的随机信任图
+        :return: 带有表示不信任关系的随机信任图，对角线元素为0
         """
         shape = (self.client_num_in_total, self.client_num_in_total)
         min_value, max_value = value_range
@@ -188,6 +198,8 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         # 以一定概率设置某些信任值为负无穷，表示完全不信任
         distrust_mask = np.random.rand(*shape) < distrust_probability
         trust_array[distrust_mask] = -np.inf
+        # 将对角线元素设置为0
+        np.fill_diagonal(trust_array, 0)
         return trust_array
 
     def upgrade_union_uid(self, union, uid_old, uid_new, nid=None):  # 新旧联盟的交替(通常发生在某客户离开/加入某联盟，会产生新的联盟，此时需要修改其余成员的记录)
@@ -215,26 +227,28 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
                         break
                 if can_add:
                     unions[uid].append(customer_id)
-                    self.his_client_unions[customer_id][uid] = None
+                    self.his_client_unions[customer_id][uid] = None  # 此时联盟还未稳定，先不计算偏好值
                     added = True
                     break
             if not added:
                 new_uid = unions.add([customer_id])
-                self.his_client_unions[customer_id][new_uid] = None
+                self.his_client_unions[customer_id][new_uid] = None  # 此时联盟还未稳定，先不计算偏好值
         unions.remove_empty_values()  # 清除空联盟
+        # print(unions)
 
         stable = False
         while not stable:
             stable = True  # 假设本轮次不再发生联盟变化
             for cid in range(self.client_num_in_total):  # 遍历每一位客户,初始将目前定义为最优
                 uid_i = next(reversed(self.his_client_unions[cid].keys()))  # 找到当前客户i所在的联盟id
-                best_pre_i = self.cal_preference(cid, unions[uid_i])  #
+                best_pre_i = self.cal_preference(cid, unions[uid_i])  # 先计算客户对当前联盟的偏好值
                 best_uid_i = uid_i
                 for uid, union in unions.items():
                     if uid == best_uid_i:  # 避免重新评估当前联盟
                         continue
                     else:
-                        pre = self.cal_preference(cid, union)  # 计算客户对该联盟的偏好值
+                        pre = self.cal_preference(cid, union) \
+                            if uid not in self.his_client_unions[cid] else 0  # 计算客户对该新联盟的偏好值（此时需要考虑历史联盟的问题）
                         if pre > best_pre_i:
                             best_pre_i = pre
                             best_uid_i = uid
@@ -255,6 +269,19 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
                     self.his_client_unions[cid].pop(uid_i)
                     self.upgrade_union_uid(union_latter, best_uid_i, new_uid_latter, cid)
                 unions.remove_empty_values()  # 清除空联盟
+
+        # 新增代码：在最终联盟确定后，清除只有一个客户的联盟
+        for uid, union in unions.items():  # 使用list来避免在遍历时修改字典
+            if len(union) == 1:
+                self.client_banned_List[union[0]] = 1  # 因为不成盟被剔除
+                unions.remove(uid)
+            else:
+                for cid in union:  # 清除社会信任不足阈值的成员
+                    if self.cal_trust_sum(union, cid) < self.common_params['trust_threshold']:
+                        self.his_client_unions[cid].pop(uid)
+                        self.client_banned_List[cid] = 2  # 因为社会信任不足被剔除
+                        union.remove(cid)
+
         # 返回稳定的联盟
         return unions
 
@@ -282,7 +309,7 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
             imp_data = 1 - imp_compute
             self.imp_unions[best_cid] = (imp_compute, imp_data)
 
-    def cal_preference(self, i, union):  # 客户对联盟的偏好函数,暂时不考虑历史联盟
+    def cal_preference(self, i, union):  # 客户对联盟的偏好函数,暂时不考虑历史联盟 (计算时不考虑历史参与)
         pre = 0.0
         for j in union:
             if self.trust_matrix[i][j] == -np.inf:
@@ -293,15 +320,19 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
                 pre += self.trust_matrix[i][j]
         return pre
 
+    def cal_trust_sum(self, union, cid):
+        return np.sum([self.trust_matrix[i][cid] for i in union])
+
     def cal_data_quality(self, u_cid):  # 计算联盟内成员的数据质量(这的数据质量不太一样，是按类别在整体的权熵，不是EMD)
         entropy = {}  # 暂存每位客户数据概率分布的熵
-        total_label_num = {i: 0 for i in range(self.class_num)}  # 统计每个类别的总数
         label_num_per_client = {}  # 统计联盟内每个客户的每个类别的样本量
         for cid in self.client_unions[u_cid]:
             label_num_per_client[cid] = []
+            total_sample_num = self.client_list[cid].get_sample_number()
             for j in range(self.class_num):
-                total_label_num[j] += self.client_list[cid].get_sample_class_number(j)
-                label_num_per_client[cid].append(self.client_list[cid].get_sample_class_number(j))
+                this_sample_num = self.client_list[cid].get_sample_class_number(j)
+                label_num_per_client[cid].append((this_sample_num + 1)
+                                                 / total_sample_num + self.class_num)
         # 计算每位客户的类别熵权
         for cid in self.client_unions[u_cid]:
             sum_entropy = 0
@@ -321,11 +352,12 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
             pay = payment_vector[i]
             band_per = bandwidth_vector[i]
             g_i = self.client_params[cid]['rho'] * self.client_params[cid]['sigma'] * (
-                    128.1 + 37.6 * np.exp(2, self.client_params[cid]['d']))
+                    128.1 + 37.6 * np.log2(self.client_params[cid]['d']))
             c_cm = (self.client_params[cid]['lambda_cm'] * self.client_params[cid]['p'] *
-                    self.common_params['M'] / band_per * self.common_params['B'] * np.log(2, 1 + g_i *
-                                                                                          self.client_params[cid]['p'] /
-                                                                                          self.common_params['Z0']))
+                    self.common_params['M'] / (band_per * self.common_params['B'] * np.log2(1 + g_i *
+                                                                                            self.client_params[cid][
+                                                                                                'p'] /
+                                                                                            self.common_params['Z'])))
             c_cp = (self.client_params[cid]['lambda_cp'] * self.client_params[cid]['miu'] * self.common_params['delta']
                     * self.client_params[cid]['D'] * self.common_params['I']
                     * self.common_params['e'] * self.client_params[cid]['f'] ** 2)
@@ -337,16 +369,20 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         n = len(x) // 2
         price = x[:n]  # 解耦出两类决策变量
         band = x[n:2 * n]
+        # print(band)
         t_cm = []
         t_cp = []
         values = []
         for i, cid in enumerate(self.client_unions[uid]):
             t_cp.append(self.client_params[cid]['miu'] * self.common_params['delta'] * self.client_params[cid]['D']
                         * self.common_params['I'] * self.common_params['e'] / self.client_params[cid]['f'])
-            t_cm.append(band[i] * self.common_params['M'] / self.common_params['B']
-                        * np.log(2, 1 + self.client_params[cid]['rho'] * self.client_params[cid]['sigma']
-                                 * (128.1 + 37.6 * np.exp(2, self.client_params[cid]['d']))
-                                 * self.client_params[cid]['p'] / self.common_params['Z0']))
+            g_i = self.client_params[cid]['rho'] * self.client_params[cid]['sigma'] * (
+                    128.1 + 37.6 * np.log2(self.client_params[cid]['d']))
+            t_cm.append(self.common_params['M'] / (band[i] * self.common_params['B'] * np.log2(1 + g_i *
+                                                                                               self.client_params[cid][
+                                                                                                   'p'] /
+                                                                                               self.common_params[
+                                                                                                   'Z'])))
             data_value = self.client_quality_list[cid]['q'] * self.imp_unions[uid][1]
             cp_value = self.imp_unions[uid][0] ** 2 * price[i] / (2 * self.client_params[cid]['lambda_cp']
                                                                   * self.client_params[cid]['miu'] * self.common_params[
@@ -359,10 +395,21 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         obj = np.sum(values) + t_max * self.common_params['omega']
         return obj
 
+    def _calculate_flag_max(self, uid, cid, f_min):
+        flag_max = (2 * self.client_params[cid]['lambda_cp'] * self.client_params[cid]['miu']
+                    * self.common_params['delta'] * self.client_params[cid]['D']
+                    * self.common_params['I'] * f_min / self.imp_unions[uid][0])
+        return flag_max
+
+    def _calculate_flag_min(self, uid, cid, f_max):
+        flag_min = (2 * self.client_params[cid]['lambda_cp'] * self.client_params[cid]['miu']
+                    * self.common_params['delta'] * self.client_params[cid]['D']
+                    * self.common_params['I'] * f_max / self.imp_unions[uid][0])
+        return flag_min
+
     def ms_cons(self, x, uid):
         n = len(x) // 2
-        price = x[:n]  # 解耦出两类决策变量
-        band = x[n:2 * n]
+        price = x[:n]  # 解耦出价格决策变量
         p_min = np.min(price)
         p_max = np.max(price)
         f_min = np.min([self.client_params[cid]['f'] for cid in self.client_unions[uid]])
@@ -370,48 +417,52 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         price_max = []
         price_min = []
         for cid in self.client_unions[uid]:
-            flag_max = (2 * self.client_params[cid]['lambda_cp'] * self.client_params[cid]['miu']
-                        * self.common_params['delta'] * self.client_params[cid]['D']
-                        * self.common_params['I'] * f_min / self.imp_unions[uid][0])
-            flag_min = (2 * self.client_params[cid]['lambda_cp'] * self.client_params[cid]['miu']
-                        * self.common_params['delta'] * self.client_params[cid]['D']
-                        * self.common_params['I'] * f_max / self.imp_unions[uid][0])
-            price_max.append(np.max(p_min, flag_max))
-            price_min.append(np.min(p_max, flag_min))
+            flag_max = self._calculate_flag_max(uid, cid, f_min)
+            flag_min = self._calculate_flag_min(uid, cid, f_max)
+            price_max.append(max(p_min, flag_max))
+            price_min.append(min(p_max, flag_min))
         price_max = np.array(price_max)
         price_min = np.array(price_min)  # 大于/小于，没有等号的话，需要加入一个微小的正数
-        cons = [{'type': 'eq', 'fun': lambda x1: np.sum(band) - 1},  # 带宽占比的和为1
-                {'type': 'ineq', 'fun': lambda x2: np.min(band) + 1e-8},  # 带宽占比的最小值大于0
-                {'type': 'ineq', 'fun': lambda x3: 1 - np.max(band) + 1e-8},  # 带宽占比的最大值小于1
-                {'type': 'ineq', 'fun': lambda x4: np.min(price - price_min)},  # 每个单位支付大于等于最小值
-                {'type': 'ineq', 'fun': lambda x5: np.max(price_max - price)}  # 每个单位支付小于等于最大值
-                ]
+        cons = [
+            {'type': 'eq', 'fun': lambda x: np.sum(x[n:2 * n]) - 1},  # 带宽占比的和为1
+            {'type': 'ineq', 'fun': lambda x: np.min(x[:n] - price_min)},  # 每个单位支付大于等于最小值
+            {'type': 'ineq', 'fun': lambda x: np.max(price_max - x[:n])},  # 每个单位支付小于等于最大值
+            {'type': 'ineq', 'fun': lambda x: np.min(x[n:2 * n] - 1e-8)},  # 带宽占比大于0
+            {'type': 'ineq', 'fun': lambda x: np.min(1 - x[n:2 * n] - 1e-8)}  # 带宽占比小于1
+        ]
         return cons
 
     def ms_game_solution(self, u_cid):  # 主从博弈最优求解（按盟主id来）不用计算时间开销，问题定义的比较清晰，只用带入
         # 先生成一组随机分配(支付向量、带宽分配比向量)
-        member_count = len(self.client_unions[u_cid])
-        bandwidth_allocation = np.random.rand(member_count)
-        bandwidth_vector = bandwidth_allocation / bandwidth_allocation.sum()
-        payment_allocation = np.random.rand(member_count)
-        payment_allocation /= payment_allocation.sum()
-        payment_vector = payment_allocation * self.common_params['P']
+        pay_vector, band_vector = [], []
+        member_count = 0
+        for _ in self.client_unions[u_cid]:
+            band_vector.append(np.random.rand())
+            pay_vector.append(np.random.uniform(1, 10))
+            member_count += 1
+        band_vector = np.array(pay_vector)
+        band_vector = band_vector / np.sum(band_vector)
+        pay_min = min(pay_vector)
+        pay_max = max(pay_vector)
+        f_max = interval_params['f'][1]
+        f_min = interval_params['f'][0]
+        pay_vector = [np.random.uniform(max(pay_min, self._calculate_flag_max(u_cid, cid, f_min)),
+                                        min(pay_max, self._calculate_flag_min(u_cid, cid, f_max))) for cid in
+                      self.client_unions[u_cid]]
         # 第二阶段：求出初始分配下，成员的均衡解-计算每位成员此时的效用，根据效用取值决定其均衡解
         # 先计算联盟中每个成员的数据质量：
         self.cal_data_quality(u_cid)
         # 然后计算每位客户此时的效用
-        utility_per_client = self.cal_client_utility(u_cid, bandwidth_vector, payment_vector)
+        utility_per_client = self.cal_client_utility(u_cid, band_vector, pay_vector)
         strategy_per_client = {}  # 每位成员最终的付出值(二阶段的均衡解)
         for cid, u in utility_per_client.items():  # 根据当前效用值来确定每位成员的均衡解
             if u <= 0:
                 strategy_per_client[cid] = 0.0
             else:
-                f_flag = (self.imp_unions[u_cid][0] ** 2 * payment_vector[cid] / 2 * self.client_params[cid][
+                f_flag = (self.imp_unions[u_cid][0] ** 2 * pay_vector[cid] / 2 * self.client_params[cid][
                     'lambda_cp']
                           * self.client_params[cid]['miu'] * self.common_params['delta'] * self.client_params[cid][
                               'D'] * self.common_params['I'] * self.common_params['e'])
-                f_max = interval_params['f'][1]
-                f_min = interval_params['f'][0]
                 if f_flag >= f_max:
                     strategy_per_client[cid] = f_max
                 elif f_flag <= f_min:
@@ -419,32 +470,35 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
                 else:
                     strategy_per_client[cid] = f_flag
         # 第一阶段，求出当前盟主的均衡解, 调用minimize函数时传入额外参数
-        x0 = np.concatenate((payment_vector, bandwidth_vector))
-        bounds = [(None, None)] * member_count + [(1e-8, 1 - 1e-8)] * member_count  # 带宽向量在(0,1)之间
+        x0 = np.concatenate((pay_vector, band_vector))
+        print(x0)
         solution = minimize(
             fun=self.ms_obj,
             x0=x0,
             args=(u_cid,),
-            method='SLSQP',
-            bounds=bounds,  # 这里为什么报类型错误不是很清楚，官方文档里写的可以字典或者字典列表
+            method='SLSQP',  # 这里为什么报类型错误不是很清楚，官方文档里写的可以字典或者字典列表
             constraints=self.ms_cons(x0, u_cid),
+            tol=1e-3,
+            options={'disp': True}
         )
         # 检查解决方案
         if solution.success:
             print("Optimal solution for union of {} found.".format(u_cid))
             # 最优解
             optimal_x = solution.x
-            payment_vector = optimal_x[:member_count]
-            bandwidth_vector = optimal_x[member_count:2 * member_count]
+            pay_vector = optimal_x[:member_count]
+            band_vector = optimal_x[member_count:2 * member_count]
             # 目标函数的最优值
             optimal_fun = solution.fun
         else:
             print("Optimal solution for union of {} failed.".format(u_cid))
+        print(strategy_per_client)
         for i, cid in enumerate(self.client_unions[u_cid]):  # 每位成员最终的分配值(一阶段的均衡解)
             if strategy_per_client[cid] > 0:
-                self.client_rewards[cid] = (payment_vector[i], bandwidth_vector[i])
+                self.client_rewards[cid] = (pay_vector[i], band_vector[i])
             else:
                 self.client_rewards[cid] = (0, 0)
+                self.client_banned_List[cid] = 3  # 因为均衡解为0被剔除
 
     def _setup_clients(self, train_data_local_num_dict,
                        train_data_local_dict, test_data_local_dict, model_trainer, ):
@@ -463,6 +517,8 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
             self.client_list.append(c)
         # 客户交互属性的生成
         self.params_generator()
+        print(self.client_params)
+        print(self.common_params)
         logging.info("############setup_clients (END)#############")
 
     def train(self):
@@ -471,23 +527,39 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         mlops.log_training_status(mlops.ClientConstants.MSG_MLOPS_CLIENT_STATUS_TRAINING)
         mlops.log_aggregation_status(mlops.ServerConstants.MSG_MLOPS_SERVER_STATUS_RUNNING)
         mlops.log_round_info(self.args.comm_round, -1)
+        mlops.event("信任图生成", event_started=True)
+        self.trust_matrix = self.create_trust_graph()  # 客户交互图生成
+        print(self.trust_matrix)
+        mlops.event("信任图生成", event_started=False)
 
+        mlops.event("联盟生成", event_started=True)
+        unions = self.unions_formation()  # 初始联盟划分，并得到最优化的划分
+        # print(unions)
+        mlops.event("联盟生成", event_started=False)
+
+        mlops.event("联盟主选举", event_started=True)
+        self.cm_election(unions)  # 联盟主选举，并得到完整的联盟划分
+        # print(self.client_unions)
+        mlops.event("联盟主选举", event_started=False)
+
+        for u_cid, union in self.client_unions.items():  # 先把两阶段的东西全部弄完，主要是淘汰掉失信客户
+            mlops.event("主从博弈求解", event_started=True, event_value="盟主：{}".format(str(u_cid)))
+            self.ms_game_solution(u_cid)  # 完成主从博弈最优求解（求出带宽、支付分配，及客户淘汰）
+            mlops.event("主从博弈求解", event_started=False, event_value="盟主：{}".format(str(u_cid)))
+        print(self.client_rewards)
+        print(self.client_banned_List)
         for round_idx in range(self.args.comm_round):
             logging.info("################Communication round : {}".format(round_idx))
             w_unions = {}  # 暂存联盟主返回的模型，用于全局聚合， 以联盟主id为键
             g_weights = {}  # 暂存全局聚合的权重，以联盟主id为键
-
-            # 联盟生成与最优化阶段
-            unions = self.unions_formation()  # 初始联盟划分，并得到最优化的划分
-            self.cm_election(unions)  # 联盟主选举，并得到完整的联盟划分
             for u_cid, union in self.client_unions.items():
-                self.ms_game_solution(u_cid)  # 完成主从博弈最优求解（求出带宽、支付分配，及客户淘汰）
                 time_s = time.time()
                 w_locals = []  # 暂存联盟内客户端返回的模型
                 u_weights = []  # 暂存联盟内部聚合权重
                 # 联盟主及其联盟成员训练
                 for cid in union + [u_cid]:
-                    if self.client_rewards[cid] == (0, 0):  # 排除不参与训练的客户
+                    band_id_list = list(self.client_banned_List.keys())
+                    if cid in band_id_list:  # 排除不参与训练的客户
                         continue
                     client = self.client_list[cid]
                     client.update_local_dataset(
