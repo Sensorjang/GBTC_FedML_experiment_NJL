@@ -13,11 +13,9 @@ from fedml.ml.trainer.trainer_creator import create_model_trainer
 from .client import Client
 import openpyxl
 import time
-
+global_num_clients = 60  # 不要太多了，否则最优解的判断题条件
 # 常超参数
 interval_params = {
-    'N': (20, 30),  # 客户端数量范围
-    'D': (200, 1600),  # 数据集大小范围
     'miu': (15, 20),  # 处理单位样本所需的CPU周期数
     'p': (0.5, 1),  # 客户端发射功率
     'f': (0.05, 0.4),  # 客户端的cpu频率范围
@@ -27,19 +25,23 @@ interval_params = {
     'M': 3.4 * 10 ** 6,  # 模型大小
     'sigma': 1,  # 小尺度衰落，瑞利分布的方差
     'rho': 8,  # 阴影衰落， 对数正态分布的标准差
-    'I': 5,  # 本地训练epoch大小
-    'batch_size': 10,  # 本地训练批大小
-    'lr': 0.01,  # 本地训练学习率
     'e': 1e-28,  # 计算芯片组有效电容参数
     'd': (0, 0.08),  # 客户端与联邦服务器的物理距离/km
     'k': 10,  # 初始联盟的个数
     'omega': 900,  # 联盟主对支付成本与训练时间的权衡系数,
-    'lambda_cm': (1e-7, 1e-7),  # 客户单位通信开销范围
-    'lambda_cp': (1e-7, 1e-7),  # 客户单位计算开销范围
-    'trust_threshold': 5,  # 联盟信任阈值（低于阈值的剔除）
-    'pay_range': (10, 200),  # 盟主支付元素的范围
-}
-quality_weights = {'cpu': 0.25, 'ram': 0.25, 'bm': 0.25, 'q': 0.25}
+    'lambda_cm': (1e-8, 1e-7),  # 客户单位通信开销范围
+    'lambda_cp': (1e-8, 1e-7),  # 客户单位计算开销范围
+    'trust_threshold': 20,  # 联盟信任阈值（低于阈值的剔除）
+    'pay_range': (10, 100),  # 盟主支付元素的范围
+    'data_imp': (0.5, 0.9),  # 盟主对数据质量的重视程度
+    'data_share': (0.05, 0.1),  # 成员对盟主的数据共享率
+    # 'N': (20, 30),  # 客户端数量范围
+    # 'D': (200, 1600),  # 数据集大小范围
+    # 'I': 5,  # 本地训练epoch大小
+    # 'batch_size': 10,  # 本地训练批大小
+    # 'lr': 0.01,  # 本地训练学习率
+}  # 注释掉的全部到yaml中设置
+quality_weights = {'cpu': 0.05, 'ram': 0.05, 'bm': 0.05, 'q': 0.85}  # 重视数据质量
 quality_ranges = {'cpu': (1, 5), 'ram': (1, 5), 'bm': (1, 5)}
 accuracy_list = []
 loss_list = []
@@ -106,6 +108,9 @@ class AutoIncrementDict:
         keys_to_remove = [key for key, value in self._data.items() if not value]
         for key in keys_to_remove:
             del self._data[key]
+    def ban_union(self, keys_to_remove):
+        for key in keys_to_remove:
+            del self._data[key]
 
 
 class FedGBTCAPI(object):  # 变量参考FARA代码
@@ -129,7 +134,7 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         self.train_data_num_in_total = train_data_num
         self.test_data_num_in_total = test_data_num
         self.class_num = class_num
-        self.client_num_in_total = np.random.randint(low=interval_params['N'][0], high=interval_params['N'][1] + 1)
+        self.client_num_in_total = global_num_clients
         self.client_list = []  # 原始的客户集合（全部），不以联盟区分
         self.train_data_local_num_dict = train_data_local_num_dict
         self.train_data_local_dict = train_data_local_dict
@@ -141,7 +146,7 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         self.client_params = {i: {} for i in range(self.client_num_in_total)}  # 存储每个客户的交互参数
         self.client_quality_list = {  # 存储客户的特征向量（质量属性）
             i: {'cpu': np.random.randint(low=quality_ranges['cpu'][0], high=quality_ranges['cpu'][1] + 1),
-                'ram': np.random.randint(low=quality_ranges['ram'][0], high=quality_ranges['ram'][1] + 1),
+                'ram': np.random.randint(low=quality_ranges['ram'][0], high=quality_ranges['ram'][1] + 1),  # 其余打酱油的属性随机生成，数据质量后面会计算
                 'bm': np.random.randint(low=quality_ranges['bm'][0], high=quality_ranges['bm'][1] + 1), 'q': 0.0}
             for i in range(self.client_num_in_total)}
         self.trust_matrix = None  # 初始化直接生成信任矩阵，全局静态
@@ -166,7 +171,6 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         for key, value in interval_params.items():
             if key == 'sigma':
                 rl = np.random.rayleigh(scale=value, size=self.client_num_in_total)
-                print(rl)
                 for i, sigma_i in enumerate(rl):
                     self.client_params[i]['sigma'] = sigma_i
             elif key == 'rho':
@@ -175,17 +179,19 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
                     self.client_params[i]['rho'] = rho_i
             elif key == 'pay_range':  # 支付元素的大小范围，转存到self
                 self.common_params['pay_range'] = value
-            elif isinstance(value, tuple) and key != 'N':
+            elif key == 'data_imp':  # 数据质量重视程度范围，转存到self
+                self.common_params['data_imp'] = value
+            elif key == 'data_share':  # 数据共享率范围，转存到self
+                self.common_params['data_share'] = value
+            elif isinstance(value, tuple):
                 for i in range(self.client_num_in_total):
-                    if key == 'D':
-                        self.client_params[i][key] = int(np.random.uniform(*value))
-                    else:
                         self.client_params[i][key] = np.random.uniform(*value)
             else:
                 self.common_params[key] = value
-        self.args.learning_rate = interval_params['lr']
-        self.args.batch_size = interval_params['batch_size']
-        self.args.epochs = interval_params['I']
+
+        for client in self.client_list:  # 客户本地数据量的赋值
+            self.client_params[client.client_idx]['D'] = client.get_sample_number()
+        self.common_params['I'] = self.args.epochs
 
     def create_trust_graph(self, value_range=(1, 10), distrust_probability=0.01):
         """
@@ -237,7 +243,6 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
                 new_uid = unions.add([customer_id])
                 self.his_client_unions[customer_id][new_uid] = None  # 此时联盟还未稳定，先不计算偏好值
         unions.remove_empty_values()  # 清除空联盟
-        # print(unions)
 
         stable = False
         while not stable:
@@ -275,15 +280,20 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
 
         # 新增代码：在最终联盟确定后，清除只有一个客户的联盟
         for uid, union in unions.items():  # 使用list来避免在遍历时修改字典
+            for cid in union:  # 清除社会信任不足阈值的成员
+                if self.cal_trust_sum(union, cid) < self.common_params['trust_threshold']:
+                    self.his_client_unions[cid].pop(uid)
+                    self.client_banned_List[cid] = 2  # 因为社会信任不足被剔除
+                    union.remove(cid)
+        # 清除自私集群的联盟
+        ban_union_key_list = []
+        for uid, union in unions.items():
             if len(union) == 1:
-                self.client_banned_List[union[0]] = 1  # 因为不成盟被剔除
-                unions.remove(uid)
-            else:
-                for cid in union:  # 清除社会信任不足阈值的成员
-                    if self.cal_trust_sum(union, cid) < self.common_params['trust_threshold']:
-                        self.his_client_unions[cid].pop(uid)
-                        self.client_banned_List[cid] = 2  # 因为社会信任不足被剔除
-                        union.remove(cid)
+                cid = union[0]
+                self.his_client_unions[cid].pop(uid)
+                self.client_banned_List[cid] = 2  # 因为社会信任不足被剔除
+                ban_union_key_list.append(uid)
+        unions.ban_union(ban_union_key_list)
 
         # 返回稳定的联盟
         return unions
@@ -308,9 +318,20 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
             # 从联盟中移除联盟主，准备更新联盟成员信息
             self.client_unions[best_cid] = [cid for cid in union if cid != best_cid]
             self.time_unions[best_cid] = {}  # 初始化每个稳定联盟的时间记录容器，以round_idx为键
-            imp_compute = np.random.rand()
-            imp_data = 1 - imp_compute
-            self.imp_unions[best_cid] = (imp_compute, imp_data)
+            data_imp = np.random.uniform(*self.common_params['data_imp'])
+            self.imp_unions[best_cid] = (1-data_imp, data_imp)
+            self.cm_data_share(best_cid)  # 联盟内部数据贡献
+
+    def cm_data_share(self, u_cid): # 联盟内部数据贡献
+        ally_clinet =  self.client_list[u_cid]
+        for cid in self.client_unions[u_cid]:
+            client = self.client_list[cid]
+            share_rate = np.random.uniform(*self.common_params['data_share'])
+            share_data, share_number = client.share_data_up(share_rate)
+            ally_clinet.get_shared_data(cid, share_data, share_number)
+        # 盟主装载联盟共享数据集
+        ally_clinet.update_share_data()
+
 
     def cal_preference(self, i, union):  # 客户对联盟的偏好函数,暂时不考虑历史联盟 (计算时不考虑历史参与)
         pre = 0.0
@@ -326,7 +347,7 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
     def cal_trust_sum(self, union, cid):
         return np.sum([self.trust_matrix[i][cid] for i in union])
 
-    def cal_data_quality(self, u_cid):  # 计算联盟内成员的数据质量(这的数据质量不太一样，是按类别在整体的权熵，不是EMD)
+    def cal_data_quality(self, u_cid):  # 计算联盟内成员的数据质量(这的数据质量不太一样，是按类别在整体的权熵，不是EMD) 所需的参数全部由客户提供
         entropy = {}  # 暂存每位客户数据概率分布的熵
         label_num_per_client = {}  # 统计联盟内每个客户的每个类别的样本量
         for cid in self.client_unions[u_cid]:
@@ -420,8 +441,8 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         for cid in self.client_unions[u_cid]:  # 先确定每位客户的支付元素的范围，随机生成的同时保存这个范围便于约束条件的设置
             band_vector.append(np.random.rand())
             flag = self._calculate_real_bound(u_cid, cid)
-            pay_item_min = max(pay_min, f_min * flag)
-            pay_item_max = min(pay_max, f_max * flag)
+            pay_item_min = min(pay_min, f_min * flag)
+            pay_item_max = max(pay_max, f_max * flag)
             pay_vector.append(np.random.uniform(pay_item_min, pay_item_max))
             print((pay_item_max, pay_item_min))
             ubound_pay.append(pay_item_max)
@@ -490,8 +511,8 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
             if strategy_per_client[cid] > 0:
                 self.client_rewards[cid] = (pay_vector[i], band_vector[i])
             else:
-                self.client_rewards[cid] = (0, 0)
-                self.client_banned_List[cid] = 3  # 因为均衡解为0被剔除
+                self.client_rewards[cid] = (0, 0)  # 联盟内部均衡解不淘汰
+                # self.client_banned_List[cid] = 3  # 因为均衡解为0被剔除
 
     def _setup_clients(self, train_data_local_num_dict,
                        train_data_local_dict, test_data_local_dict, model_trainer, ):
@@ -510,8 +531,6 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
             self.client_list.append(c)
         # 客户交互属性的生成
         self.params_generator()
-        print(self.client_params)
-        print(self.common_params)
         logging.info("############setup_clients (END)#############")
 
     def train(self):
@@ -527,7 +546,7 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
 
         mlops.event("联盟生成", event_started=True)
         unions = self.unions_formation()  # 初始联盟划分，并得到最优化的划分
-        # print(unions)
+        print(unions)
         mlops.event("联盟生成", event_started=False)
 
         mlops.event("联盟主选举", event_started=True)
@@ -537,10 +556,9 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
 
         for u_cid, union in self.client_unions.items():  # 先把两阶段的东西全部弄完，主要是淘汰掉失信客户
             mlops.event("主从博弈求解", event_started=True, event_value="盟主：{}".format(str(u_cid)))
-            self.ms_game_solution(u_cid)  # 完成主从博弈最优求解（求出带宽、支付分配，及客户淘汰）
+            self.ms_game_solution(u_cid)  # 完成主从博弈最优求解（求出带宽、支付分配）
             mlops.event("主从博弈求解", event_started=False, event_value="盟主：{}".format(str(u_cid)))
-        print(self.client_rewards)
-        print(self.client_banned_List)
+        print(len(self.client_banned_List))
         for round_idx in range(self.args.comm_round):
             logging.info("################Communication round : {}".format(round_idx))
             w_unions = {}  # 暂存联盟主返回的模型，用于全局聚合， 以联盟主id为键
@@ -555,11 +573,6 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
                     if cid in band_id_list:  # 排除不参与训练的客户
                         continue
                     client = self.client_list[cid]
-                    client.update_local_dataset(
-                        self.train_data_local_dict[cid],
-                        self.test_data_local_dict[cid],
-                        self.train_data_local_num_dict[cid]
-                    )  # 加入该成员的聚合权重
                     u_weights.append(client.local_sample_number)
                     mlops.event("train", event_started=True,
                                 event_value="{}_{}".format(str(round_idx), str(client.client_idx)))

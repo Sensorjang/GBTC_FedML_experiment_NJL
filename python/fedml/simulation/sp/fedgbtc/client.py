@@ -1,4 +1,6 @@
+import numpy as np
 import torch
+from torch.utils.data import Subset, DataLoader, ConcatDataset, TensorDataset
 
 
 class Client:
@@ -9,7 +11,7 @@ class Client:
         self.local_training_data = local_training_data
         self.local_test_data = local_test_data
         self.local_sample_number = local_sample_number
-
+        self.share_training_data_dict = {}  # 盟主客户收获的联盟共享数据集
         self.args = args
         self.device = device
         self.model_trainer = model_trainer
@@ -20,6 +22,48 @@ class Client:
         self.local_test_data = local_test_data
         self.local_sample_number = local_sample_number
         # self.model_trainer.set_id(client_idx)
+
+    def update_share_data(self):
+        # Step 1: 收集并合并所有数据集
+        all_datasets = [self.local_training_data.dataset]
+        for cid, (share_data, share_number) in self.share_training_data_dict.items():
+            all_datasets.append(share_data)
+            self.local_sample_number += share_number
+
+        combined_dataset = ConcatDataset(all_datasets)
+        # Step 2: 使用合并后的数据集创建新的DataLoader
+        self.local_training_data = DataLoader(combined_dataset, batch_size=self.args.batch_size, shuffle=True,
+                                              num_workers=self.args.num_workers)
+
+    def get_shared_data(self, cid, share_training_data, share_number):
+        self.share_training_data_dict[cid] = (share_training_data, share_number)
+
+    def share_data_up(self, share_rate):  # 将共享的数据直接提取出来，而不是subset
+        print(len(self.local_training_data.dataset))
+        print(self.local_sample_number)
+        # 确定共享的样本数量
+        share_number = int(self.local_sample_number * share_rate)
+        # 生成随机索引
+        indices = np.arange(self.local_sample_number)
+        np.random.shuffle(indices)
+        share_indices = indices[:share_number]
+        print(share_indices)
+        # 初始化列表来存储选中的数据和标签
+        shared_data_list = []
+        shared_targets_list = []
+        # 从原始dataset中抽取对应的数据和标签
+        for idx in share_indices:
+            data, target = self.local_training_data.dataset[idx]
+            shared_data_list.append(data)
+            shared_targets_list.append(target)
+        # 将列表转换为张量
+        shared_data = torch.stack(shared_data_list)
+        shared_targets = torch.tensor(shared_targets_list, dtype=torch.long)
+        # 创建新的TensorDataset
+        shared_dataset = TensorDataset(shared_data, shared_targets)
+
+        return shared_dataset, share_number
+
 
     def get_sample_number(self):
         return self.local_sample_number

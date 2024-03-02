@@ -4,7 +4,7 @@ common_args:
   excel_save_path: "D:\\"
 
 data_args:
-  dataset: "mnist"
+  dataset: "cifar10"
   data_cache_dir: ~/fedml_data
   partition_method: "hetero"
   partition_alpha: 0.5
@@ -21,15 +21,15 @@ data_args:
 #  fed_cifar100  resnet18_gn
 
 model_args:
-  model: "cnn"
+  model: "cnn_web"
 
 train_args:
   federated_optimizer: "FedGBTC"
   client_id_list: "[]"
   client_num_in_total: 60
-  client_num_per_round: 40 # useless param
+  client_num_per_round: 60
   comm_round: 250
-  epochs: 1
+  epochs: 5
   batch_size: 10
   client_optimizer: sgd
   learning_rate: 0.03
