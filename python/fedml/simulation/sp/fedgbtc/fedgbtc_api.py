@@ -2,7 +2,7 @@ import copy
 import logging
 import random
 from collections import OrderedDict
-from scipy.optimize import minimize
+from scipy.optimize import minimize, Bounds
 from scipy.stats import lognorm
 import matplotlib.pyplot as plt
 import numpy as np
@@ -34,9 +34,10 @@ interval_params = {
     'd': (0, 0.08),  # 客户端与联邦服务器的物理距离/km
     'k': 10,  # 初始联盟的个数
     'omega': 900,  # 联盟主对支付成本与训练时间的权衡系数,
-    'lambda_cm': (1, 2),  # 客户单位通信开销范围
-    'lambda_cp': (1, 2),  # 客户单位计算开销范围
-    'trust_threshold': 0.5,  # 联盟信任阈值（低于阈值的剔除）
+    'lambda_cm': (1e-7, 1e-7),  # 客户单位通信开销范围
+    'lambda_cp': (1e-7, 1e-7),  # 客户单位计算开销范围
+    'trust_threshold': 5,  # 联盟信任阈值（低于阈值的剔除）
+    'pay_range': (10, 200),  # 盟主支付元素的范围
 }
 quality_weights = {'cpu': 0.25, 'ram': 0.25, 'bm': 0.25, 'q': 0.25}
 quality_ranges = {'cpu': (1, 5), 'ram': (1, 5), 'bm': (1, 5)}
@@ -172,6 +173,8 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
                 ln = lognorm(s=value)
                 for i, rho_i in enumerate(ln.rvs(size=self.client_num_in_total)):
                     self.client_params[i]['rho'] = rho_i
+            elif key == 'pay_range':  # 支付元素的大小范围，转存到self
+                self.common_params['pay_range'] = value
             elif isinstance(value, tuple) and key != 'N':
                 for i in range(self.client_num_in_total):
                     if key == 'D':
@@ -305,7 +308,7 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
             # 从联盟中移除联盟主，准备更新联盟成员信息
             self.client_unions[best_cid] = [cid for cid in union if cid != best_cid]
             self.time_unions[best_cid] = {}  # 初始化每个稳定联盟的时间记录容器，以round_idx为键
-            imp_compute = np.random.rand(0, 1)
+            imp_compute = np.random.rand()
             imp_data = 1 - imp_compute
             self.imp_unions[best_cid] = (imp_compute, imp_data)
 
@@ -347,122 +350,104 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
 
     def cal_client_utility(self, u_cid, bandwidth_vector, payment_vector):  # 计算联盟内所有客户的效用(传入初始分配默认以顺序作为成员索引)
         union = self.client_unions[u_cid]
+        print(union)
         utilities = {}
         for i, cid in enumerate(union):
             pay = payment_vector[i]
             band_per = bandwidth_vector[i]
-            g_i = self.client_params[cid]['rho'] * self.client_params[cid]['sigma'] * (
-                    128.1 + 37.6 * np.log2(self.client_params[cid]['d']))
-            c_cm = (self.client_params[cid]['lambda_cm'] * self.client_params[cid]['p'] *
-                    self.common_params['M'] / (band_per * self.common_params['B'] * np.log2(1 + g_i *
-                                                                                            self.client_params[cid][
-                                                                                                'p'] /
-                                                                                            self.common_params['Z'])))
-            c_cp = (self.client_params[cid]['lambda_cp'] * self.client_params[cid]['miu'] * self.common_params['delta']
-                    * self.client_params[cid]['D'] * self.common_params['I']
-                    * self.common_params['e'] * self.client_params[cid]['f'] ** 2)
+            c_cm = self.client_params[cid]['lambda_cm'] * self._cal_cm_time_flag(cid) / band_per
+            c_cp = (self.client_params[cid]['lambda_cp']
+                    * self._cal_cp_time_flag(cid)
+                    * self.common_params['e']
+                    * self.client_params[cid]['f'] ** 3)
             utilities[cid] = (self.imp_unions[u_cid][0] * self.client_params[cid]['f'] + self.imp_unions[u_cid][1]
                               * self.client_quality_list[cid]['q'] * pay - c_cm - c_cp)
-            return utilities
+        return utilities
 
-    def ms_obj(self, x, uid):  # 优化变量分别为：支付向量、带宽分配向量，整合到一个决策变量中(便于优化器)
+    def ms_obj(self, x, uid, flags):  # 优化变量分别为：支付向量、带宽分配向量，整合到一个决策变量中(便于优化器)
         n = len(x) // 2
         price = x[:n]  # 解耦出两类决策变量
         band = x[n:2 * n]
         # print(band)
         t_cm = []
-        t_cp = []
+        t_cp = copy.deepcopy(flags['time_cp'])
+        data_values = flags['data_value']
+        cp_values = flags['cp_value']
         values = []
         for i, cid in enumerate(self.client_unions[uid]):
-            t_cp.append(self.client_params[cid]['miu'] * self.common_params['delta'] * self.client_params[cid]['D']
-                        * self.common_params['I'] * self.common_params['e'] / self.client_params[cid]['f'])
-            g_i = self.client_params[cid]['rho'] * self.client_params[cid]['sigma'] * (
-                    128.1 + 37.6 * np.log2(self.client_params[cid]['d']))
-            t_cm.append(self.common_params['M'] / (band[i] * self.common_params['B'] * np.log2(1 + g_i *
-                                                                                               self.client_params[cid][
-                                                                                                   'p'] /
-                                                                                               self.common_params[
-                                                                                                   'Z'])))
-            data_value = self.client_quality_list[cid]['q'] * self.imp_unions[uid][1]
-            cp_value = self.imp_unions[uid][0] ** 2 * price[i] / (2 * self.client_params[cid]['lambda_cp']
-                                                                  * self.client_params[cid]['miu'] * self.common_params[
-                                                                      'delta']
-                                                                  * self.client_params[cid]['D'] * self.common_params[
-                                                                      'I'] * self.common_params['e'])
-            values.append((data_value + cp_value) * price[i])
-        t = t_cm + t_cp
+            t_cm.append(flags['time_cm'] / band[i])
+            values.append((cp_values[i] * price[i] + data_values[i]) * price[i])
+        t = np.array(t_cm) + np.array(t_cp)
         t_max = np.max(t)
         obj = np.sum(values) + t_max * self.common_params['omega']
         return obj
 
-    def _calculate_flag_max(self, uid, cid, f_min):
-        flag_max = (2 * self.client_params[cid]['lambda_cp'] * self.client_params[cid]['miu']
+    def _calculate_real_bound(self, uid, cid):
+        flag = (2 * self.client_params[cid]['lambda_cp'] * self.client_params[cid]['miu']
                     * self.common_params['delta'] * self.client_params[cid]['D']
-                    * self.common_params['I'] * f_min / self.imp_unions[uid][0])
-        return flag_max
+                    * self.common_params['I'] / self.imp_unions[uid][0])
+        return flag
 
-    def _calculate_flag_min(self, uid, cid, f_max):
-        flag_min = (2 * self.client_params[cid]['lambda_cp'] * self.client_params[cid]['miu']
-                    * self.common_params['delta'] * self.client_params[cid]['D']
-                    * self.common_params['I'] * f_max / self.imp_unions[uid][0])
-        return flag_min
+    def _cal_cp_value_flag(self, pre, cid):
+        return (pre ** 2 / (2 * self.client_params[cid]['lambda_cp']
+                            * self.client_params[cid]['miu'] * self.common_params['delta']
+                            * self.client_params[cid]['D'] * self.common_params['I'] * self.common_params['e']))
 
-    def ms_cons(self, x, uid):
-        n = len(x) // 2
-        price = x[:n]  # 解耦出价格决策变量
-        p_min = np.min(price)
-        p_max = np.max(price)
-        f_min = np.min([self.client_params[cid]['f'] for cid in self.client_unions[uid]])
-        f_max = np.max([self.client_params[cid]['f'] for cid in self.client_unions[uid]])
-        price_max = []
-        price_min = []
-        for cid in self.client_unions[uid]:
-            flag_max = self._calculate_flag_max(uid, cid, f_min)
-            flag_min = self._calculate_flag_min(uid, cid, f_max)
-            price_max.append(max(p_min, flag_max))
-            price_min.append(min(p_max, flag_min))
-        price_max = np.array(price_max)
-        price_min = np.array(price_min)  # 大于/小于，没有等号的话，需要加入一个微小的正数
-        cons = [
-            {'type': 'eq', 'fun': lambda x: np.sum(x[n:2 * n]) - 1},  # 带宽占比的和为1
-            {'type': 'ineq', 'fun': lambda x: np.min(x[:n] - price_min)},  # 每个单位支付大于等于最小值
-            {'type': 'ineq', 'fun': lambda x: np.max(price_max - x[:n])},  # 每个单位支付小于等于最大值
-            {'type': 'ineq', 'fun': lambda x: np.min(x[n:2 * n] - 1e-8)},  # 带宽占比大于0
-            {'type': 'ineq', 'fun': lambda x: np.min(1 - x[n:2 * n] - 1e-8)}  # 带宽占比小于1
-        ]
-        return cons
+    def _cal_data_value_flag(self, pre, cid):
+        return self.client_quality_list[cid]['q'] * pre
+
+    def _cal_cm_time_flag(self, cid):
+        g_i = self.client_params[cid]['rho'] * self.client_params[cid]['sigma'] * (
+                128.1 + 37.6 * np.log2(self.client_params[cid]['d']))
+        return (self.common_params['M'] /
+                (self.common_params['B'] * np.log2(1 + g_i * self.client_params[cid]['p']
+                                                   / self.common_params['Z'])))
+
+    def _cal_cp_time_flag(self, cid):
+        return (self.client_params[cid]['miu'] * self.common_params['delta'] * self.client_params[cid]['D']
+                * self.common_params['I'] / self.client_params[cid]['f'])
+
 
     def ms_game_solution(self, u_cid):  # 主从博弈最优求解（按盟主id来）不用计算时间开销，问题定义的比较清晰，只用带入
         # 先生成一组随机分配(支付向量、带宽分配比向量)
         pay_vector, band_vector = [], []
         member_count = 0
-        for _ in self.client_unions[u_cid]:
-            band_vector.append(np.random.rand())
-            pay_vector.append(np.random.uniform(1, 10))
-            member_count += 1
-        band_vector = np.array(pay_vector)
-        band_vector = band_vector / np.sum(band_vector)
-        pay_min = min(pay_vector)
-        pay_max = max(pay_vector)
+        pay_min = self.common_params['pay_range'][0]
+        pay_max = self.common_params['pay_range'][1]
         f_max = interval_params['f'][1]
         f_min = interval_params['f'][0]
-        pay_vector = [np.random.uniform(max(pay_min, self._calculate_flag_max(u_cid, cid, f_min)),
-                                        min(pay_max, self._calculate_flag_min(u_cid, cid, f_max))) for cid in
-                      self.client_unions[u_cid]]
+        ubound_pay, lbound_pay = [], []
+        for cid in self.client_unions[u_cid]:  # 先确定每位客户的支付元素的范围，随机生成的同时保存这个范围便于约束条件的设置
+            band_vector.append(np.random.rand())
+            flag = self._calculate_real_bound(u_cid, cid)
+            pay_item_min = max(pay_min, f_min * flag)
+            pay_item_max = min(pay_max, f_max * flag)
+            pay_vector.append(np.random.uniform(pay_item_min, pay_item_max))
+            print((pay_item_max, pay_item_min))
+            ubound_pay.append(pay_item_max)
+            lbound_pay.append(pay_item_min)
+            member_count += 1
+        band_vector = np.array(pay_vector)
+        band_vector = band_vector / np.sum(band_vector)  # 约束范围转np，便于》。。
+        lbound_pay, ubound_pay = np.array(lbound_pay), np.array(ubound_pay)
+
         # 第二阶段：求出初始分配下，成员的均衡解-计算每位成员此时的效用，根据效用取值决定其均衡解
         # 先计算联盟中每个成员的数据质量：
         self.cal_data_quality(u_cid)
         # 然后计算每位客户此时的效用
         utility_per_client = self.cal_client_utility(u_cid, band_vector, pay_vector)
         strategy_per_client = {}  # 每位成员最终的付出值(二阶段的均衡解)
-        for cid, u in utility_per_client.items():  # 根据当前效用值来确定每位成员的均衡解
+        cmp_flags, data_flags = [], []  # 记录两阶段重复计算（目标函数中，计算价值、数据价值）
+        time_cm_flags, time_cp_flags = [], []  # （约束条件中，通信/计算时间）
+        for i, (cid, u) in enumerate(utility_per_client.items()):  # 根据当前效用值来确定每位成员的均衡解
+            cmp_flags.append(self._cal_cp_value_flag(self.imp_unions[u_cid][0], cid))
+            data_flags.append(self._cal_data_value_flag(self.imp_unions[u_cid][1], cid))
+            time_cm_flags.append(self._cal_cm_time_flag(cid))
+            time_cp_flags.append(self._cal_cp_time_flag(cid))
             if u <= 0:
                 strategy_per_client[cid] = 0.0
             else:
-                f_flag = (self.imp_unions[u_cid][0] ** 2 * pay_vector[cid] / 2 * self.client_params[cid][
-                    'lambda_cp']
-                          * self.client_params[cid]['miu'] * self.common_params['delta'] * self.client_params[cid][
-                              'D'] * self.common_params['I'] * self.common_params['e'])
+                f_flag = cmp_flags[-1] * pay_vector[i]
                 if f_flag >= f_max:
                     strategy_per_client[cid] = f_max
                 elif f_flag <= f_min:
@@ -471,13 +456,21 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
                     strategy_per_client[cid] = f_flag
         # 第一阶段，求出当前盟主的均衡解, 调用minimize函数时传入额外参数
         x0 = np.concatenate((pay_vector, band_vector))
-        print(x0)
+        flags = {'cp_value': cmp_flags, 'data_value': data_flags, 'time_cm': time_cm_flags, 'time_cp': time_cp_flags}
+        # 为带宽变量创建边界（注意：这里用了稍微大于0的下界和小于1的上界来确保不触及边界）
+        lbound_bandwidth = [1e-8] * member_count  # 带宽变量的下界
+        ubound_bandwidth = [1 - 1e-8] * member_count  # 带宽变量的上界
+        # 合并边界
+        lbound = np.concatenate((lbound_pay, lbound_bandwidth))
+        ubound = np.concatenate((ubound_pay, ubound_bandwidth))
+        bounds = Bounds(lbound, ubound)
         solution = minimize(
             fun=self.ms_obj,
             x0=x0,
-            args=(u_cid,),
-            method='SLSQP',  # 这里为什么报类型错误不是很清楚，官方文档里写的可以字典或者字典列表
-            constraints=self.ms_cons(x0, u_cid),
+            args=(u_cid, flags),
+            method='trust-constr',  # 这里为什么报类型错误不是很清楚，官方文档里写的可以字典或者字典列表
+            bounds=bounds,
+            constraints={'type': 'eq', 'fun': lambda x: sum(x[member_count:2 * member_count]) - 1},
             tol=1e-3,
             options={'disp': True}
         )
@@ -539,7 +532,7 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
 
         mlops.event("联盟主选举", event_started=True)
         self.cm_election(unions)  # 联盟主选举，并得到完整的联盟划分
-        # print(self.client_unions)
+        print(self.client_unions)
         mlops.event("联盟主选举", event_started=False)
 
         for u_cid, union in self.client_unions.items():  # 先把两阶段的东西全部弄完，主要是淘汰掉失信客户
