@@ -27,7 +27,7 @@ train_args:
   federated_optimizer: "FedGBTC"
   client_id_list: "[]"
   client_num_in_total: 30
-  client_num_per_round: 40 # useless param
+  client_num_per_round: 30 # useless param
   comm_round: 250
   epochs: 1
   batch_size: 10

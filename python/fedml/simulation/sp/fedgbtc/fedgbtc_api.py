@@ -1,3 +1,4 @@
+import collections
 import copy
 import logging
 import random
@@ -10,10 +11,13 @@ import torch
 import wandb
 from fedml import mlops
 from fedml.ml.trainer.trainer_creator import create_model_trainer
+from torch.utils.data import DataLoader
+
 from .client import Client
 import openpyxl
 import time
-global_num_clients = 60  # 不要太多了，否则最优解的判断题条件
+
+global_num_clients = 30  # 不要太多了，否则最优解的判断题条件
 # 常超参数
 interval_params = {
     'miu': (15, 20),  # 处理单位样本所需的CPU周期数
@@ -45,7 +49,7 @@ quality_weights = {'cpu': 0.05, 'ram': 0.05, 'bm': 0.05, 'q': 0.85}  # 重视数
 quality_ranges = {'cpu': (1, 5), 'ram': (1, 5), 'bm': (1, 5)}
 accuracy_list = []
 loss_list = []
-k_list = []
+
 # 参数0
 # 统计global_client_num_in_total个客户每个人的被选择次数
 plt.figure(1, figsize=(16, 4))
@@ -108,6 +112,7 @@ class AutoIncrementDict:
         keys_to_remove = [key for key, value in self._data.items() if not value]
         for key in keys_to_remove:
             del self._data[key]
+
     def ban_union(self, keys_to_remove):
         for key in keys_to_remove:
             del self._data[key]
@@ -136,7 +141,7 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         self.class_num = class_num
         self.client_num_in_total = global_num_clients
         self.client_list = []  # 原始的客户集合（全部），不以联盟区分
-        self.train_data_local_num_dict = train_data_local_num_dict
+        self.train_data_local_num_dict = self.get_local_sample_num(train_data_local_dict)
         self.train_data_local_dict = train_data_local_dict
         self.test_data_local_dict = test_data_local_dict
         # 乐享联盟参数
@@ -146,7 +151,8 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         self.client_params = {i: {} for i in range(self.client_num_in_total)}  # 存储每个客户的交互参数
         self.client_quality_list = {  # 存储客户的特征向量（质量属性）
             i: {'cpu': np.random.randint(low=quality_ranges['cpu'][0], high=quality_ranges['cpu'][1] + 1),
-                'ram': np.random.randint(low=quality_ranges['ram'][0], high=quality_ranges['ram'][1] + 1),  # 其余打酱油的属性随机生成，数据质量后面会计算
+                'ram': np.random.randint(low=quality_ranges['ram'][0], high=quality_ranges['ram'][1] + 1),
+                # 其余打酱油的属性随机生成，数据质量后面会计算
                 'bm': np.random.randint(low=quality_ranges['bm'][0], high=quality_ranges['bm'][1] + 1), 'q': 0.0}
             for i in range(self.client_num_in_total)}
         self.trust_matrix = None  # 初始化直接生成信任矩阵，全局静态
@@ -163,9 +169,32 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         self.model = model
         logging.info("self.model_trainer = {}".format(self.model_trainer))
 
-        self._setup_clients(
-            train_data_local_num_dict, train_data_local_dict, test_data_local_dict, self.model_trainer,
-        )
+        self._setup_clients(train_data_local_dict, test_data_local_dict)
+
+    def get_local_sample_num(self, train_data_local_dict):
+        train_data_local_num_dict = {}
+        for cid in range(self.client_num_in_total):
+            train_data = train_data_local_dict[cid]
+            if isinstance(train_data, DataLoader):
+                # DataLoader类型，直接获取dataset的长度
+                sample_num = len(train_data.dataset)
+            elif isinstance(train_data, list):
+                # 如果train_data是列表类型，假设它是批处理后的数据
+                sample_num = 0  # 初始化样本数
+                for data, label in train_data:
+                    # 假设data是Tensor，累加每个批次的样本数
+                    if isinstance(data, torch.Tensor):
+                        sample_num += data.size(0)  # 第一个维度通常是批次中的样本数
+                        print(data.size(0))
+                    else:
+                        print(f"Unexpected data type in batch: {type(data)}")
+                        # 如果data不是Tensor，这可能需要特殊处理或抛出错误
+                print(sample_num)
+            else:
+                # 如果train_data既不是DataLoader也不是list，抛出错误
+                raise TypeError(f"Unsupported train data type: {type(train_data)}.")
+            train_data_local_num_dict[cid] = sample_num
+        return train_data_local_num_dict
 
     def params_generator(self):  # 客户独立参数的赋值
         for key, value in interval_params.items():
@@ -185,7 +214,7 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
                 self.common_params['data_share'] = value
             elif isinstance(value, tuple):
                 for i in range(self.client_num_in_total):
-                        self.client_params[i][key] = np.random.uniform(*value)
+                    self.client_params[i][key] = np.random.uniform(*value)
             else:
                 self.common_params[key] = value
 
@@ -293,6 +322,7 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
                 self.his_client_unions[cid].pop(uid)
                 self.client_banned_List[cid] = 2  # 因为社会信任不足被剔除
                 ban_union_key_list.append(uid)
+        print(ban_union_key_list)
         unions.ban_union(ban_union_key_list)
 
         # 返回稳定的联盟
@@ -319,11 +349,11 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
             self.client_unions[best_cid] = [cid for cid in union if cid != best_cid]
             self.time_unions[best_cid] = {}  # 初始化每个稳定联盟的时间记录容器，以round_idx为键
             data_imp = np.random.uniform(*self.common_params['data_imp'])
-            self.imp_unions[best_cid] = (1-data_imp, data_imp)
+            self.imp_unions[best_cid] = (1 - data_imp, data_imp)
             self.cm_data_share(best_cid)  # 联盟内部数据贡献
 
-    def cm_data_share(self, u_cid): # 联盟内部数据贡献
-        ally_clinet =  self.client_list[u_cid]
+    def cm_data_share(self, u_cid):  # 联盟内部数据贡献
+        ally_clinet = self.client_list[u_cid]
         for cid in self.client_unions[u_cid]:
             client = self.client_list[cid]
             share_rate = np.random.uniform(*self.common_params['data_share'])
@@ -331,7 +361,6 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
             ally_clinet.get_shared_data(cid, share_data, share_number)
         # 盟主装载联盟共享数据集
         ally_clinet.update_share_data()
-
 
     def cal_preference(self, i, union):  # 客户对联盟的偏好函数,暂时不考虑历史联盟 (计算时不考虑历史参与)
         pre = 0.0
@@ -405,8 +434,8 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
 
     def _calculate_real_bound(self, uid, cid):
         flag = (2 * self.client_params[cid]['lambda_cp'] * self.client_params[cid]['miu']
-                    * self.common_params['delta'] * self.client_params[cid]['D']
-                    * self.common_params['I'] / self.imp_unions[uid][0])
+                * self.common_params['delta'] * self.client_params[cid]['D']
+                * self.common_params['I'] / self.imp_unions[uid][0])
         return flag
 
     def _cal_cp_value_flag(self, pre, cid):
@@ -427,7 +456,6 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
     def _cal_cp_time_flag(self, cid):
         return (self.client_params[cid]['miu'] * self.common_params['delta'] * self.client_params[cid]['D']
                 * self.common_params['I'] / self.client_params[cid]['f'])
-
 
     def ms_game_solution(self, u_cid):  # 主从博弈最优求解（按盟主id来）不用计算时间开销，问题定义的比较清晰，只用带入
         # 先生成一组随机分配(支付向量、带宽分配比向量)
@@ -514,8 +542,7 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
                 self.client_rewards[cid] = (0, 0)  # 联盟内部均衡解不淘汰
                 # self.client_banned_List[cid] = 3  # 因为均衡解为0被剔除
 
-    def _setup_clients(self, train_data_local_num_dict,
-                       train_data_local_dict, test_data_local_dict, model_trainer, ):
+    def _setup_clients(self, train_data_local_dict, test_data_local_dict):
         logging.info("############setup_clients (START)#############")
         # 参数1
         for client_idx in range(self.client_num_in_total):
@@ -523,10 +550,10 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
                 client_idx,
                 train_data_local_dict[client_idx],
                 test_data_local_dict[client_idx],
-                train_data_local_num_dict[client_idx],
+                self.train_data_local_num_dict[client_idx],
                 self.args,
                 self.device,
-                model_trainer,
+                copy.deepcopy(self.model_trainer),  # 深复制一下比较好
             )
             self.client_list.append(c)
         # 客户交互属性的生成
@@ -559,37 +586,40 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
             self.ms_game_solution(u_cid)  # 完成主从博弈最优求解（求出带宽、支付分配）
             mlops.event("主从博弈求解", event_started=False, event_value="盟主：{}".format(str(u_cid)))
         print(len(self.client_banned_List))
+
         for round_idx in range(self.args.comm_round):
             logging.info("################Communication round : {}".format(round_idx))
-            w_unions = {}  # 暂存联盟主返回的模型，用于全局聚合， 以联盟主id为键
-            g_weights = {}  # 暂存全局聚合的权重，以联盟主id为键
+            w_unions = []  # 暂存联盟主返回的模型，用于全局聚合， 以联盟主id为键
             for u_cid, union in self.client_unions.items():
-                time_s = time.time()
+                num_union = 0  # 记录联盟内的总样本量
                 w_locals = []  # 暂存联盟内客户端返回的模型
-                u_weights = []  # 暂存联盟内部聚合权重
+                time_s = time.time()
                 # 联盟主及其联盟成员训练
+                mlops.event("Train", event_started=True,
+                            event_value="轮次{}_联盟主{}".format(str(round_idx), str(u_cid)))
                 for cid in union + [u_cid]:
                     band_id_list = list(self.client_banned_List.keys())
                     if cid in band_id_list:  # 排除不参与训练的客户
                         continue
                     client = self.client_list[cid]
-                    u_weights.append(client.local_sample_number)
-                    mlops.event("train", event_started=True,
-                                event_value="{}_{}".format(str(round_idx), str(client.client_idx)))
+                    mlops.event("train", event_started=True, event_edge_id=u_cid)
                     w = client.train(copy.deepcopy(w_global))
-                    mlops.event("train", event_started=False,
-                                event_value="{}_{}".format(str(round_idx), str(client.client_idx)))
-                    w_locals.append((client.get_sample_number(), copy.deepcopy(w), client.client_idx))
+                    mlops.event("train", event_started=True, event_edge_id=u_cid)
+                    num_i = client.get_sample_number()
+                    num_union += num_i
+                    w_locals.append((num_i, copy.deepcopy(w)))
+                mlops.event("Train", event_started=False,
+                            event_value="轮次{}_联盟主{}".format(str(round_idx), str(u_cid)))
                 # 联盟内部聚合
                 mlops.event("agg", event_started=True, event_value="轮次{}_联盟主{}".format(str(round_idx), str(u_cid)))
-                w_unions[u_cid] = self._aggregate(w_locals, u_weights)
+                w_unions.append((num_union, self._aggregate(w_locals)))
                 mlops.event("agg", event_started=True, event_value="轮次{}_联盟主{}".format(str(round_idx), str(u_cid)))
                 time_e = time.time()  # 记录每个联盟的整体执行时间
-                self.time_unions[u_cid][round_idx] = time_e - time_s
+                self.time_unions[u_cid][round_idx] = time_e - time_s  # 记录联盟内运行时间
 
             # 全局聚合
             mlops.event("agg", event_started=True, event_value="轮次{}_全局".format(str(round_idx)))
-            w_global = self._aggregate(list(w_unions.values()), list(g_weights.values()))
+            w_global = self._aggregate(w_unions)
             self.model_trainer.set_model_params(w_global)
             mlops.event("agg", event_started=False, event_value="轮次{}_全局".format(str(round_idx)))
 
@@ -649,32 +679,19 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         sample_testset = torch.utils.data.DataLoader(subset, batch_size=self.args.batch_size)
         self.val_global = sample_testset
 
-    def _aggregate(self, w_locals, eweights):
-        # training_num = 0
-        # for idx in range(len(w_locals)):
-        #     (sample_num, averaged_params) = w_locals[idx]
-        #     training_num += sample_num
-        print("_aggregate.w_locals.length = " + str(len(w_locals)) + "\n" + "_aggregate.eweights.length = " + str(
-            len(eweights)))
+    def _aggregate(self, w_locals):
+        print("_aggregate.w_locals.length = " + str(len(w_locals)))
+        num_sum = sum([sample_num for sample_num, _ in w_locals])
 
-        eweights_sum = sum(eweights)
+        # 初始化一个空的有序字典来存储平均后的参数
+        averaged_params = collections.OrderedDict()
 
-        (sample_num, averaged_params, _) = w_locals[0]
-        for k in averaged_params.keys():
-            print("______k = " + str(k))
-            for i in range(0, len(w_locals)):
-                # local_sample_number, local_model_params = w_locals[i]
-                local_model_params = w_locals[i][1]
-                local_wight_number = eweights[i]
+        # 获取第一个本地模型的参数作为基础结构
+        _, first_model_params = w_locals[0]
+        for k in first_model_params.keys():
+            # 对于每个参数，计算加权平均值
+            averaged_params[k] = sum([w_locals[i][1][k] * w_locals[i][0] / num_sum for i in range(len(w_locals))])
 
-                w = local_wight_number / eweights_sum
-
-                # print("w = " + str(w))
-
-                if i == 0:
-                    averaged_params[k] = local_model_params[k] * w
-                else:
-                    averaged_params[k] += local_model_params[k] * w
         return averaged_params
 
     def _aggregate_resnet(self, w_locals, eweights):  # 弃用
@@ -735,7 +752,6 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
             if self.test_data_local_dict[client_idx] is None:
                 continue
             client.update_local_dataset(
-                0,
                 self.train_data_local_dict[client_idx],
                 self.test_data_local_dict[client_idx],
                 self.train_data_local_num_dict[client_idx],
@@ -866,12 +882,12 @@ def plot_accuracy_and_loss(self, round_idx):
     plt.ylabel("value of loss")
     plt.plot(range(1, len(loss_list) + 1), loss_list, 'b-', linewidth=2)
 
-    # 第3个子图
-    plt.subplot(2, 2, 3)
-    plt.title("k")
-    plt.xlabel("num of epoch")
-    plt.ylabel("value of k")
-    plt.plot(range(1, len(k_list) + 1), k_list, 'b-', linewidth=2)
+    # # 第3个子图
+    # plt.subplot(2, 2, 3)
+    # plt.title("k")
+    # plt.xlabel("num of epoch")
+    # plt.ylabel("value of k")
+    # plt.plot(range(1, len(k_list) + 1), k_list, 'b-', linewidth=2)
 
     # # 第4个子图，使用条形图展示每个客户的被选择次数
     # plt.subplot(2, 2, 4)

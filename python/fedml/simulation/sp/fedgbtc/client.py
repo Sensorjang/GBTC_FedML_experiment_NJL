@@ -1,6 +1,8 @@
 import numpy as np
 import torch
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Subset, DataLoader, ConcatDataset, TensorDataset
+from torch.utils.data.dataloader import default_collate
 
 
 class Client:
@@ -15,6 +17,7 @@ class Client:
         self.args = args
         self.device = device
         self.model_trainer = model_trainer
+        self.model_trainer.set_id(client_idx)  # 设置客户端id
 
     def update_local_dataset(self, local_training_data, local_test_data, local_sample_number):
         # self.client_idx = client_idx  # 客户id是静态的，没必要重复更新其id
@@ -23,47 +26,66 @@ class Client:
         self.local_sample_number = local_sample_number
         # self.model_trainer.set_id(client_idx)
 
-    def update_share_data(self):
-        # Step 1: 收集并合并所有数据集
-        all_datasets = [self.local_training_data.dataset]
-        for cid, (share_data, share_number) in self.share_training_data_dict.items():
-            all_datasets.append(share_data)
-            self.local_sample_number += share_number
+    def share_data_up(self, share_rate):
+        indices = np.random.permutation(len(self.local_training_data.dataset))[
+                  :int(len(self.local_training_data.dataset) * share_rate)]
+        shared_data_list = []
+        shared_targets_list = []
+        for idx in indices:
+            data, target = self.local_training_data.dataset[idx]
 
-        combined_dataset = ConcatDataset(all_datasets)
-        # Step 2: 使用合并后的数据集创建新的DataLoader
-        self.local_training_data = DataLoader(combined_dataset, batch_size=self.args.batch_size, shuffle=True,
-                                              num_workers=self.args.num_workers)
+            # 检查data是否为Tensor，如果不是，则尝试转换
+            if not isinstance(data, torch.Tensor):
+                data = torch.tensor(data, dtype=torch.float32)
+            # 检查target是否为Tensor，如果不是，则尝试转换
+            if isinstance(target, (np.integer, int)):
+                target = torch.tensor(target, dtype=torch.long)
+
+            # 检查data是否为空
+            if data.nelement() == 0:  # 或者使用data.numel() == 0
+                print(f"Warning: Empty data item at index {idx}. Skipping this item.")
+                continue
+
+            shared_data_list.append(data)
+            shared_targets_list.append(target)
+
+        # 检查是否有数据被添加，以防所有项都为空
+        if not shared_data_list or not shared_targets_list:
+            raise ValueError("All shared data items are empty. Please check the dataset.")
+
+        shared_data = torch.stack(shared_data_list)
+        shared_targets = torch.stack(shared_targets_list)
+        shared_dataset = TensorDataset(shared_data, shared_targets)
+
+        return shared_dataset, len(shared_data_list)
 
     def get_shared_data(self, cid, share_training_data, share_number):
         self.share_training_data_dict[cid] = (share_training_data, share_number)
 
-    def share_data_up(self, share_rate):  # 将共享的数据直接提取出来，而不是subset
-        print(len(self.local_training_data.dataset))
-        print(self.local_sample_number)
-        # 确定共享的样本数量
-        share_number = int(self.local_sample_number * share_rate)
-        # 生成随机索引
-        indices = np.arange(self.local_sample_number)
-        np.random.shuffle(indices)
-        share_indices = indices[:share_number]
-        print(share_indices)
-        # 初始化列表来存储选中的数据和标签
-        shared_data_list = []
-        shared_targets_list = []
-        # 从原始dataset中抽取对应的数据和标签
-        for idx in share_indices:
-            data, target = self.local_training_data.dataset[idx]
-            shared_data_list.append(data)
-            shared_targets_list.append(target)
-        # 将列表转换为张量
-        shared_data = torch.stack(shared_data_list)
-        shared_targets = torch.tensor(shared_targets_list, dtype=torch.long)
-        # 创建新的TensorDataset
-        shared_dataset = TensorDataset(shared_data, shared_targets)
+    def update_share_data(self):
+        all_datasets = [self.local_training_data.dataset]
+        total_samples = len(self.local_training_data.dataset)
+        for cid, (share_data, share_number) in self.share_training_data_dict.items():
+            all_datasets.append(share_data)
+            total_samples += share_number
+        combined_dataset = ConcatDataset(all_datasets)
+        self.local_training_data = DataLoader(combined_dataset, batch_size=self.local_training_data.batch_size,
+                                              shuffle=True, num_workers=self.local_training_data.num_workers,
+                                              collate_fn=self.custom_collate_fn)  # 使用自定义的collate_fn
+        self.local_sample_number = total_samples
 
-        return shared_dataset, share_number
-
+    def custom_collate_fn(self, batch):
+        data_list = []
+        target_list = []
+        for data, target in batch:
+            # 确保数据是Tensor
+            data_list.append(data if isinstance(data, torch.Tensor) else torch.tensor(data))
+            target_list.append(target if isinstance(target, torch.Tensor) else torch.tensor(target, dtype=torch.long))
+        # 对数据进行填充
+        data_padded = pad_sequence(data_list, batch_first=True)
+        # 对标签使用默认的collate处理（如果标签也是变长的，可能需要相似的处理）
+        target_collated = default_collate(target_list)
+        return data_padded, target_collated
 
     def get_sample_number(self):
         return self.local_sample_number

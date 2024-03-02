@@ -6,9 +6,9 @@ common_args:
 data_args:
   dataset: "cifar10"
   data_cache_dir: ~/fedml_data
-  partition_method: "hetero"
-  partition_alpha: 0.5
-  experiment_niid_level: 0.7
+  partition_method: "homo"
+  partition_alpha: 0
+  experiment_niid_level: 0
   #experiment_niid_level = 1 means that the data is niid
   #experiment_niid_level = 0 means that the data is iid
   #experiment_niid_level = (0,1) e.g. 0.7 means that the data is partially niid
@@ -26,10 +26,10 @@ model_args:
 train_args:
   federated_optimizer: "FedGBTC"
   client_id_list: "[]"
-  client_num_in_total: 60
-  client_num_per_round: 60
+  client_num_in_total: 30
+  client_num_per_round: 30
   comm_round: 250
-  epochs: 5
+  epochs: 1
   batch_size: 10
   client_optimizer: sgd
   learning_rate: 0.03
