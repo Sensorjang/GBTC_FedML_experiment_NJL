@@ -3,6 +3,8 @@ import copy
 import logging
 import random
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+
 from scipy.optimize import minimize, Bounds
 from scipy.stats import lognorm
 import matplotlib.pyplot as plt
@@ -17,7 +19,7 @@ from .client import Client
 import openpyxl
 import time
 
-global_num_clients = 30  # 不要太多了，否则最优解的判断题条件
+global_num_clients = 30  # 不要太多了，否则求解时间太长
 # 常超参数
 interval_params = {
     'miu': (15, 20),  # 处理单位样本所需的CPU周期数
@@ -37,7 +39,7 @@ interval_params = {
     'lambda_cp': (1e-8, 1e-7),  # 客户单位计算开销范围
     'trust_threshold': 20,  # 联盟信任阈值（低于阈值的剔除）
     'pay_range': (10, 100),  # 盟主支付元素的范围
-    'data_imp': (0.5, 0.9),  # 盟主对数据质量的重视程度
+    'data_imp': (0.6, 0.9),  # 盟主对数据质量的重视程度
     'data_share': (0.05, 0.1),  # 成员对盟主的数据共享率
     # 'N': (20, 30),  # 客户端数量范围
     # 'D': (200, 1600),  # 数据集大小范围
@@ -49,6 +51,7 @@ quality_weights = {'cpu': 0.05, 'ram': 0.05, 'bm': 0.05, 'q': 0.85}  # 重视数
 quality_ranges = {'cpu': (1, 5), 'ram': (1, 5), 'bm': (1, 5)}
 accuracy_list = []
 loss_list = []
+train_time_list = []
 
 # 参数0
 # 统计global_client_num_in_total个客户每个人的被选择次数
@@ -161,7 +164,7 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         self.imp_unions = {}  # 记录每个联盟对不同资源的重视程度(元组字典)
         # 历史联盟(客户历史所参与的,还没有盟主，字典存放联盟的id-客户对其偏好值)
         self.his_client_unions = {i: {} for i in range(self.client_num_in_total)}
-        self.client_banned_List = {}  # 存储被剔除的客户（键为id、值为 1. 不成盟 2. 累计信任值不足 3. 均衡解为0）
+        self.client_banned_list = {}  # 存储被剔除的客户（键为id、值为 1. 不成盟 2. 累计信任值不足 3. 均衡解为0）
         self.client_rewards = {}  # 存储每个客户的奖励值
 
         logging.info("model = {}".format(model))
@@ -312,7 +315,7 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
             for cid in union:  # 清除社会信任不足阈值的成员
                 if self.cal_trust_sum(union, cid) < self.common_params['trust_threshold']:
                     self.his_client_unions[cid].pop(uid)
-                    self.client_banned_List[cid] = 2  # 因为社会信任不足被剔除
+                    self.client_banned_list[cid] = 2  # 因为社会信任不足被剔除
                     union.remove(cid)
         # 清除自私集群的联盟
         ban_union_key_list = []
@@ -320,7 +323,7 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
             if len(union) == 1:
                 cid = union[0]
                 self.his_client_unions[cid].pop(uid)
-                self.client_banned_List[cid] = 2  # 因为社会信任不足被剔除
+                self.client_banned_list[cid] = 2  # 因为社会信任不足被剔除
                 ban_union_key_list.append(uid)
         print(ban_union_key_list)
         unions.ban_union(ban_union_key_list)
@@ -540,7 +543,7 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
                 self.client_rewards[cid] = (pay_vector[i], band_vector[i])
             else:
                 self.client_rewards[cid] = (0, 0)  # 联盟内部均衡解不淘汰
-                # self.client_banned_List[cid] = 3  # 因为均衡解为0被剔除
+                # self.client_banned_List[cid] = 3  # 因为均衡解为0被剔除(弃用)
 
     def _setup_clients(self, train_data_local_dict, test_data_local_dict):
         logging.info("############setup_clients (START)#############")
@@ -560,68 +563,77 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         self.params_generator()
         logging.info("############setup_clients (END)#############")
 
+
+    def train_union(self, u_cid, w_global):
+        union = self.client_unions[u_cid]
+        num_union = 0  # 记录联盟内的总样本量
+        w_locals = []  # 暂存联盟内客户端返回的模型
+        for cid in union + [u_cid]:
+            client = self.client_list[cid]
+            mlops.event("train", event_started=True, event_edge_id=u_cid)
+            w = client.train(copy.deepcopy(w_global))
+            mlops.event("train", event_started=True, event_edge_id=u_cid)
+            num_i = self.train_data_local_num_dict[cid]
+            num_union += num_i
+            w_locals.append((num_i, copy.deepcopy(w)))
+        return num_union, w_locals
+
+
     def train(self):
         logging.info("self.model_trainer = {}".format(self.model_trainer))
         w_global = self.model_trainer.get_model_params()
         mlops.log_training_status(mlops.ClientConstants.MSG_MLOPS_CLIENT_STATUS_TRAINING)
         mlops.log_aggregation_status(mlops.ServerConstants.MSG_MLOPS_SERVER_STATUS_RUNNING)
         mlops.log_round_info(self.args.comm_round, -1)
+        # 乐享联盟
         mlops.event("信任图生成", event_started=True)
         self.trust_matrix = self.create_trust_graph()  # 客户交互图生成
         print(self.trust_matrix)
         mlops.event("信任图生成", event_started=False)
-
         mlops.event("联盟生成", event_started=True)
         unions = self.unions_formation()  # 初始联盟划分，并得到最优化的划分
         print(unions)
         mlops.event("联盟生成", event_started=False)
-
         mlops.event("联盟主选举", event_started=True)
         self.cm_election(unions)  # 联盟主选举，并得到完整的联盟划分
         print(self.client_unions)
         mlops.event("联盟主选举", event_started=False)
-
+        # 主从博弈
         for u_cid, union in self.client_unions.items():  # 先把两阶段的东西全部弄完，主要是淘汰掉失信客户
             mlops.event("主从博弈求解", event_started=True, event_value="盟主：{}".format(str(u_cid)))
             self.ms_game_solution(u_cid)  # 完成主从博弈最优求解（求出带宽、支付分配）
             mlops.event("主从博弈求解", event_started=False, event_value="盟主：{}".format(str(u_cid)))
-        print(len(self.client_banned_List))
+        print(len(self.client_banned_list))
 
         for round_idx in range(self.args.comm_round):
             logging.info("################Communication round : {}".format(round_idx))
-            w_unions = []  # 暂存联盟主返回的模型，用于全局聚合， 以联盟主id为键
-            for u_cid, union in self.client_unions.items():
-                num_union = 0  # 记录联盟内的总样本量
-                w_locals = []  # 暂存联盟内客户端返回的模型
-                time_s = time.time()
-                # 联盟主及其联盟成员训练
-                mlops.event("Train", event_started=True,
-                            event_value="轮次{}_联盟主{}".format(str(round_idx), str(u_cid)))
-                for cid in union + [u_cid]:
-                    band_id_list = list(self.client_banned_List.keys())
-                    if cid in band_id_list:  # 排除不参与训练的客户
-                        continue
-                    client = self.client_list[cid]
-                    mlops.event("train", event_started=True, event_edge_id=u_cid)
-                    w = client.train(copy.deepcopy(w_global))
-                    mlops.event("train", event_started=True, event_edge_id=u_cid)
-                    num_i = client.get_sample_number()
-                    num_union += num_i
-                    w_locals.append((num_i, copy.deepcopy(w)))
-                mlops.event("Train", event_started=False,
-                            event_value="轮次{}_联盟主{}".format(str(round_idx), str(u_cid)))
-                # 联盟内部聚合
-                mlops.event("agg", event_started=True, event_value="轮次{}_联盟主{}".format(str(round_idx), str(u_cid)))
-                w_unions.append((num_union, self._aggregate(w_locals)))
-                mlops.event("agg", event_started=True, event_value="轮次{}_联盟主{}".format(str(round_idx), str(u_cid)))
-                time_e = time.time()  # 记录每个联盟的整体执行时间
-                self.time_unions[u_cid][round_idx] = time_e - time_s  # 记录联盟内运行时间
+            w_unions = {}  # 暂存联盟主返回的模型，用于全局聚合， 以联盟主id为键
+            time_s = time.time()  # 记录训练开始时间, 多线程并行运行每个联盟的训练
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                futures = {}
+                for u_cid in self.client_unions:
+                    # 提交任务到线程池
+                    future = executor.submit(self.train_union, u_cid, w_global)
+                    futures[u_cid] = future
+                # 等待所有任务完成
+                for u_cid, future in futures.items():  # 存入：(联盟总样本量、w_locals)
+                    u_sample_num, w_locals = future.result()
+                    w_unions[u_cid] = (u_sample_num, w_locals)
+            time_e = time.time()  # 记录训练开始时间, 多线程并行运行每个联盟的训练
+            train_time_list.append(time_e - time_s)
+
+            # 联盟聚合
+            w_final = []
+            for u_cid, (u_sample_num, w_locals) in w_unions.items():
+                mlops.event("Agg", event_started=True, event_value="轮次{}_联盟主{}".format(str(round_idx), str(u_cid)))
+                w_final.append((u_sample_num, self._aggregate(w_locals)))
+                mlops.event("Agg", event_started=True, event_value="轮次{}_联盟主{}".format(str(round_idx), str(u_cid)))
 
             # 全局聚合
-            mlops.event("agg", event_started=True, event_value="轮次{}_全局".format(str(round_idx)))
-            w_global = self._aggregate(w_unions)
+            mlops.event("Agg", event_started=True, event_value="轮次{}_全局".format(str(round_idx)))
+            w_global = self._aggregate(w_final)
             self.model_trainer.set_model_params(w_global)
-            mlops.event("agg", event_started=False, event_value="轮次{}_全局".format(str(round_idx)))
+            mlops.event("Agg", event_started=False, event_value="轮次{}_全局".format(str(round_idx)))
 
             # test results
             # at last round
@@ -637,13 +649,6 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
 
             mlops.log_round_info(self.args.comm_round, round_idx)
 
-            # round_ws.append([round_idx,
-            #                     train_loss,
-            #                     train_acc,
-            #                     time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
-            #                     str(client_indexes),
-            #                     str(client_selected_times),
-            #                     k])
 
             # 保存Excel文件到self.args.excel_save_path+文件名
             wb.save(
@@ -654,23 +659,6 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
 
         mlops.log_training_finished_status()
         mlops.log_aggregation_finished_status()
-
-    def _client_sampling(self, round_idx, client_list, banned_client_indexs):
-        # round 0 select all, then select client which is not banned
-        if round_idx == 0:
-            client_indexes = [client.client_idx for client in client_list]
-        else:
-            client_indexes = [client.client_idx for client in client_list if
-                              client.client_idx not in banned_client_indexs]
-
-        # if client_num_in_total == client_num_per_round:
-        #     client_indexes = [client_index for client_index in range(client_num_in_total)]
-        # else:
-        #     num_clients = min(client_num_per_round, client_num_in_total)
-        #     np.random.seed(round_idx)  # make sure for each comparison, we are selecting the same clients each round
-        #     client_indexes = np.random.choice(range(client_num_in_total), num_clients, replace=False)
-        # logging.info("client_indexes = %s" % str(client_indexes))
-        return client_indexes
 
     def _generate_validation_set(self, num_samples=10000):
         test_data_num = len(self.test_global.dataset)

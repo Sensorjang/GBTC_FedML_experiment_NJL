@@ -10,14 +10,17 @@ import wandb
 
 from fedml import mlops
 from fedml.ml.trainer.trainer_creator import create_model_trainer
+from torch.utils.data import DataLoader
+
 from .client import Client
 import matplotlib.pyplot as plt
 
-global_client_num_in_total = 60
-global_client_num_per_round = 30
-
+global_client_num_in_total = 30
+# 记录每轮的信息
 accuracy_list = []
 loss_list = []
+train_time = []
+
 # 参数0
 # 统计global_client_num_in_total个客户每个人的被选择次数
 client_selected_times = [0 for i in range(global_client_num_in_total)]
@@ -35,6 +38,55 @@ round_ws = wb.create_sheet('Round Info')
 round_ws.append(['Round', 'Loss', 'Accuracy', 'Time', 'Selected Client Indexs', 'Total Selected Client Times'])
 # 设置时间间隔（以秒为单位）
 interval = 5
+
+class AutoIncrementDict:
+    def __init__(self):
+        self._data = {}
+        self._next_id = 0
+
+    def add(self, value):
+        self._data[self._next_id] = value
+        current_id = self._next_id
+        self._next_id += 1
+        return current_id
+
+    def remove(self, key):
+        if key in self._data:
+            del self._data[key]
+
+    def get(self, key):
+        return self._data.get(key, None)
+
+    def __getitem__(self, key):
+        return self.get(key)
+
+    def __delitem__(self, key):
+        self.remove(key)
+
+    def __repr__(self):
+        return repr(self._data)
+
+    def items(self):
+        return self._data.items()
+
+    def keys(self):
+        return self._data.keys()
+
+    def values(self):
+        return self._data.values()
+
+    def remove_empty_values(self):
+        keys_to_remove = [key for key, value in self._data.items() if not value]
+        for key in keys_to_remove:
+            del self._data[key]
+
+    def ban_union(self, keys_to_remove):
+        for key in keys_to_remove:
+            del self._data[key]
+
+
+
+
 
 class FedAvgAPI(object):
     def __init__(self, args, device, dataset, model):
@@ -58,24 +110,53 @@ class FedAvgAPI(object):
         self.train_data_num_in_total = train_data_num
         self.test_data_num_in_total = test_data_num
         # 参数1
-        self.args.client_num_in_total = global_client_num_in_total #added
-        self.args.client_num_per_round = global_client_num_per_round #added
+        self.client_num_in_total = global_client_num_in_total #added
         self.client_list = []
-        self.train_data_local_num_dict = train_data_local_num_dict
+        self.train_data_local_num_dict = self.get_local_sample_num(train_data_local_dict)
         self.train_data_local_dict = train_data_local_dict
         self.test_data_local_dict = test_data_local_dict
 
+        # 历史联盟(客户历史所参与的,还没有盟主，字典存放联盟的id-客户对其偏好值)
+        self.trust_threshold = 20
+        self.his_client_unions = {i: {} for i in range(self.client_num_in_total)}
         logging.info("model = {}".format(model))
         self.model_trainer = create_model_trainer(model, args)
         self.model = model
         logging.info("self.model_trainer = {}".format(self.model_trainer))
 
         self._setup_clients(
-            train_data_local_num_dict, train_data_local_dict, test_data_local_dict, self.model_trainer,
+            train_data_local_dict, test_data_local_dict, self.model_trainer,
         )
 
+    # 返回的样本量信息未对齐，暂时直接查询
+    def get_local_sample_num(self, train_data_local_dict):
+        train_data_local_num_dict = {}
+        for cid in range(self.client_num_in_total):
+            train_data = train_data_local_dict[cid]
+            if isinstance(train_data, DataLoader):
+                # DataLoader类型，直接获取dataset的长度
+                sample_num = len(train_data.dataset)
+            elif isinstance(train_data, list):
+                # 如果train_data是列表类型，假设它是批处理后的数据
+                sample_num = 0  # 初始化样本数
+                for data, label in train_data:
+                    # 假设data是Tensor，累加每个批次的样本数
+                    if isinstance(data, torch.Tensor):
+                        sample_num += data.size(0)  # 第一个维度通常是批次中的样本数
+                        print(data.size(0))
+                    else:
+                        print(f"Unexpected data type in batch: {type(data)}")
+                        # 如果data不是Tensor，这可能需要特殊处理或抛出错误
+                print(sample_num)
+            else:
+                # 如果train_data既不是DataLoader也不是list，抛出错误
+                raise TypeError(f"Unsupported train data type: {type(train_data)}.")
+            train_data_local_num_dict[cid] = sample_num
+        return train_data_local_num_dict
+
+
     def _setup_clients(
-        self, train_data_local_num_dict, train_data_local_dict, test_data_local_dict, model_trainer,
+        self, train_data_local_dict, test_data_local_dict, model_trainer,
     ):
         logging.info("############setup_clients (START)#############")
         for client_idx in range(self.args.client_num_in_total):
@@ -83,13 +164,133 @@ class FedAvgAPI(object):
                 client_idx,
                 train_data_local_dict[client_idx],
                 test_data_local_dict[client_idx],
-                train_data_local_num_dict[client_idx],
+                self.train_data_local_num_dict[client_idx],
                 self.args,
                 self.device,
-                model_trainer,
+                copy.deepcopy(model_trainer),
             )
             self.client_list.append(c)
         logging.info("############setup_clients (END)#############")
+
+    def create_trust_graph(self, value_range=(1, 10), distrust_probability=0.01):
+        """
+        修改后的函数，以一定的概率生成表示完全不信任的负无穷值，并将对角线元素设置为0。
+        :param value_range: 信任值的范围，为(min_value, max_value)
+        :param distrust_probability: 完全不信任的概率
+        :return: 带有表示不信任关系的随机信任图，对角线元素为0
+        """
+        shape = (self.client_num_in_total, self.client_num_in_total)
+        min_value, max_value = value_range
+        # 生成随机信任值数组
+        trust_array = np.random.rand(*shape) * (max_value - min_value) + min_value
+        # 以一定概率设置某些信任值为负无穷，表示完全不信任
+        distrust_mask = np.random.rand(*shape) < distrust_probability
+        trust_array[distrust_mask] = -np.inf
+        # 将对角线元素设置为0
+        np.fill_diagonal(trust_array, 0)
+        return trust_array
+
+    def cal_preference(self, i, union):  # 客户对联盟的偏好函数,暂时不考虑历史联盟 (计算时不考虑历史参与)
+        pre = 0.0
+        for j in union:
+            if self.trust_matrix[i][j] == -np.inf:
+                pre = -np.inf
+                break
+            # elif
+            else:
+                pre += self.trust_matrix[i][j]
+        return pre
+
+    def upgrade_union_uid(self, union, uid_old, uid_new, nid=None):  # 新旧联盟的交替(通常发生在某客户离开/加入某联盟，会产生新的联盟，此时需要修改其余成员的记录)
+        for cid in union:  # 这里可选则将新增客户id传入,避免删除旧联盟id记录的操作
+            if cid != nid:
+                self.his_client_unions[cid].pop(uid_old)
+            self.his_client_unions[cid][uid_new] = self.cal_preference(cid, union)
+
+    def cal_trust_sum(self, union, cid):
+        return np.sum([self.trust_matrix[i][cid] for i in union])
+
+    def unions_formation(self):
+        """
+        生成初始联盟划分，同时避免联盟中存在信任值为负无穷的客户关系。
+        """
+        customer_ids = np.arange(self.client_num_in_total)
+        np.random.shuffle(customer_ids)
+        unions = AutoIncrementDict()
+        client_selfish_list = []
+        # 初始化联盟字典（自动计数id）
+        for customer_id in customer_ids:
+            added = False
+            for uid, members in unions.items():
+                can_add = True
+                for member in members:
+                    if (self.trust_matrix[customer_id, member] == -np.inf or
+                            self.trust_matrix[member, customer_id] == -np.inf):
+                        can_add = False
+                        break
+                if can_add:
+                    unions[uid].append(customer_id)
+                    self.his_client_unions[customer_id][uid] = None  # 此时联盟还未稳定，先不计算偏好值
+                    added = True
+                    break
+            if not added:
+                new_uid = unions.add([customer_id])
+                self.his_client_unions[customer_id][new_uid] = None  # 此时联盟还未稳定，先不计算偏好值
+        unions.remove_empty_values()  # 清除空联盟
+
+        stable = False
+        while not stable:
+            stable = True  # 假设本轮次不再发生联盟变化
+            for cid in range(self.client_num_in_total):  # 遍历每一位客户,初始将目前定义为最优
+                uid_i = next(reversed(self.his_client_unions[cid].keys()))  # 找到当前客户i所在的联盟id
+                best_pre_i = self.cal_preference(cid, unions[uid_i])  # 先计算客户对当前联盟的偏好值
+                best_uid_i = uid_i
+                for uid, union in unions.items():
+                    if uid == best_uid_i:  # 避免重新评估当前联盟
+                        continue
+                    else:
+                        pre = self.cal_preference(cid, union) \
+                            if uid not in self.his_client_unions[cid] else 0  # 计算客户对该新联盟的偏好值（此时需要考虑历史联盟的问题）
+                        if pre > best_pre_i:
+                            best_pre_i = pre
+                            best_uid_i = uid
+                            stable = False  # 如果发生了联盟变化，则本轮次不再稳定
+
+                if best_uid_i != uid_i:  # 如果找到了更好的联盟,双更新,也要更新原来两个联盟中客户绑定的uid
+                    # 更新旧联盟
+                    union_former = unions[uid_i]
+                    union_former.remove(cid)
+                    unions.remove(uid_i)
+                    new_uid_former = unions.add(union_former)
+                    self.upgrade_union_uid(union_former, uid_i, new_uid_former)
+                    # 更新新联盟
+                    union_latter = unions[best_uid_i]
+                    unions.remove(best_uid_i)
+                    union_latter.append(cid)
+                    new_uid_latter = unions.add(union_latter)
+                    self.his_client_unions[cid].pop(uid_i)
+                    self.upgrade_union_uid(union_latter, best_uid_i, new_uid_latter, cid)
+                unions.remove_empty_values()  # 清除空联盟
+
+        # 新增代码：在最终联盟确定后，清除只有一个客户的联盟
+        for uid, union in unions.items():  # 使用list来避免在遍历时修改字典
+            for cid in union:  # 清除社会信任不足阈值的成员
+                if self.cal_trust_sum(union, cid) < self.trust_threshold:
+                    self.his_client_unions[cid].pop(uid)
+                    client_selfish_list.append(cid)  # 因为社会信任不足被剔除
+                    union.remove(cid)
+        # 清除自私集群的联盟
+        # ban_union_key_list = []
+        for uid, union in unions.items():
+            if len(union) == 1:
+                cid = union[0]
+                self.his_client_unions[cid].pop(uid)
+                client_selfish_list.append(cid)  # 因为社会信任不足被剔除
+                # ban_union_key_list.append(uid)
+        # print(ban_union_key_list)
+        # unions.ban_union(ban_union_key_list)
+        return client_selfish_list
+
 
     def train(self):
         logging.info("self.model_trainer = {}".format(self.model_trainer))
@@ -97,49 +298,40 @@ class FedAvgAPI(object):
         mlops.log_training_status(mlops.ClientConstants.MSG_MLOPS_CLIENT_STATUS_TRAINING)
         mlops.log_aggregation_status(mlops.ServerConstants.MSG_MLOPS_SERVER_STATUS_RUNNING)
         mlops.log_round_info(self.args.comm_round, -1)
+        # 这部分同GBTC，用于确定那些是自私客户
+        mlops.event("信任图生成", event_started=True)
+        self.trust_matrix = self.create_trust_graph()  # 客户交互图生成
+        print(self.trust_matrix)
+        mlops.event("信任图生成", event_started=False)
+        mlops.event("联盟生成", event_started=True)
+        client_selfish_list = self.unions_formation()  # 初始联盟划分
+        mlops.event("联盟生成", event_started=False)
+        logging.info("client_banned_indexes = " + str(client_selfish_list))
+
         for round_idx in range(self.args.comm_round):
 
             logging.info("################Communication round : {}".format(round_idx))
-
             w_locals = []
-
-            """
-            for scalability: following the original FedAvg algorithm, we uniformly sample a fraction of clients in each round.
-            Instead of changing the 'Client' instances, our implementation keeps the 'Client' instances and then updates their local dataset 
-            """
-            client_indexes = self._client_sampling(
-                round_idx, self.args.client_num_in_total, self.args.client_num_per_round
-            )
-            logging.info("client_indexes = " + str(client_indexes))
-
-            for idx, client in enumerate(self.client_list):
-                # update dataset
-                # 判断如果idx是client_indexes中的某一client的下标，那么就更新这个client的数据集
-                if client.client_idx in client_indexes:
-                    client_idx = client.client_idx
-                    client.update_local_dataset(
-                        client_idx,
-                        self.train_data_local_dict[client_idx],
-                        self.test_data_local_dict[client_idx],
-                        self.train_data_local_num_dict[client_idx],
-                    )
-
-                    # train on new dataset
-                    mlops.event("train", event_started=True, event_value="{}_{}".format(str(round_idx), str(client.client_idx)))
+            s_time = time.time()
+            for client in self.client_list:
+                # 自私客户不训练
+                if client.client_idx not in client_selfish_list:
+                    type = '诚实'
+                    mlops.event("train", event_started=True, event_value="轮次{}_客户id{}_类型{}".format(str(round_idx), str(client.client_idx), type))
                     w = client.train(copy.deepcopy(w_global))
-                    mlops.event("train", event_started=False, event_value="{}_{}".format(str(round_idx), str(client.client_idx)))
-                    # self.logging.info("local weights = " + str(w))
+                    mlops.event("train", event_started=False, event_value="轮次{}_客户id{}_类型{}".format(str(round_idx), str(client.client_idx), type))
                     w_locals.append((client.get_sample_number(), copy.deepcopy(w)))
+                else:
+                    type = '自私'
+                    mlops.event("train", event_started=True, event_value="轮次{}_客户id{}_类型{}".format(str(round_idx), str(client.client_idx), type))
+                    w = copy.deepcopy(w_global)
+                    mlops.event("train", event_started=False, event_value="轮次{}_客户id{}_类型{}".format(str(round_idx), str(client.client_idx), type))
+                    w_locals.append((client.get_sample_number(), w))
+            e_time = time.time()
+            train_time.append(e_time - s_time)  # 记录本轮的训练时间
 
-            # 借助client_selected_times统计global_client_num_in_total个客户每个人的被选择次数
-            for i in client_indexes:
-                client_selected_times[i] += 1
-
-            # update global weights
             mlops.event("agg", event_started=True, event_value=str(round_idx))
-
             w_global = self._aggregate(w_locals)
-
             self.model_trainer.set_model_params(w_global)
             mlops.event("agg", event_started=False, event_value=str(round_idx))
 
@@ -156,13 +348,6 @@ class FedAvgAPI(object):
                     train_acc, train_loss, test_acc, test_loss = self._local_test_on_all_clients(round_idx)
 
             mlops.log_round_info(self.args.comm_round, round_idx)
-
-            round_ws.append([round_idx,
-                                train_loss,
-                                train_acc,
-                                time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
-                                str(client_indexes),
-                                str(client_selected_times)])
 
             # 保存Excel文件到self.args.excel_save_path+文件名
             wb.save(self.args.excel_save_path + self.args.model + "_[" + self.args.dataset +"]_fedavg_training_results_NIID"+ str(self.args.experiment_niid_level) +".xlsx")
@@ -417,12 +602,12 @@ def plot_accuracy_and_loss(self, round_idx):
     plt.ylabel("value of loss")
     plt.plot(range(1, len(loss_list)+1), loss_list, 'b-', linewidth=2)
 
-    # 第3个子图，使用条形图展示每个客户的被选择次数
-    plt.subplot(1, 3, 3)
-    plt.title("num of selected")
-    plt.xlabel("num of epoch")
-    plt.ylabel("value of num of selected")
-    plt.bar(range(1, len(client_selected_times)+1), client_selected_times, width=0.5, fc='b')
+    # # 第3个子图，使用条形图展示每个客户的被选择次数
+    # plt.subplot(1, 3, 3)
+    # plt.title("num of selected")
+    # plt.xlabel("num of epoch")
+    # plt.ylabel("value of num of selected")
+    # plt.bar(range(1, len(client_selected_times)+1), client_selected_times, width=0.5, fc='b')
 
     plt.tight_layout()
     plt.pause(0.005)

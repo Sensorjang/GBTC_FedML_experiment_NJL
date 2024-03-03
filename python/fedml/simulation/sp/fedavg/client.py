@@ -10,13 +10,12 @@ class Client:
         self.args = args
         self.device = device
         self.model_trainer = model_trainer
+        self.model_trainer.set_id(client_idx)
 
-    def update_local_dataset(self, client_idx, local_training_data, local_test_data, local_sample_number):
-        self.client_idx = client_idx
+    def update_local_dataset(self, local_training_data, local_test_data, local_sample_number):
         self.local_training_data = local_training_data
         self.local_test_data = local_test_data
         self.local_sample_number = local_sample_number
-        self.model_trainer.set_id(client_idx)
 
     def get_sample_number(self):
         return self.local_sample_number
