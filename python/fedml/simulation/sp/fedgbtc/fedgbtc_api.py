@@ -410,7 +410,7 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
             band_per = bandwidth_vector[i]
             c_cm = self.client_params[cid]['lambda_cm'] * self._cal_cm_time_flag(cid) / band_per
             c_cp = (self.client_params[cid]['lambda_cp']
-                    * self._cal_cp_time_flag(cid)
+                    * self._cal_cp_time_flag(cid) / self.client_params[cid]['f']
                     * self.common_params['e']
                     * self.client_params[cid]['f'] ** 3)
             utilities[cid] = (self.imp_unions[u_cid][0] * self.client_params[cid]['f'] + self.imp_unions[u_cid][1]
@@ -456,9 +456,9 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
                 (self.common_params['B'] * np.log2(1 + g_i * self.client_params[cid]['p']
                                                    / self.common_params['Z'])))
 
-    def _cal_cp_time_flag(self, cid):
+    def _cal_cp_time_flag(self, cid):  # 2024-3-3 为适应两种计算(f不同)，现去掉f变量
         return (self.client_params[cid]['miu'] * self.common_params['delta'] * self.client_params[cid]['D']
-                * self.common_params['I'] / self.client_params[cid]['f'])
+                * self.common_params['I'])
 
     def ms_game_solution(self, u_cid):  # 主从博弈最优求解（按盟主id来）不用计算时间开销，问题定义的比较清晰，只用带入
         # 先生成一组随机分配(支付向量、带宽分配比向量)
@@ -495,17 +495,14 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
             cmp_flags.append(self._cal_cp_value_flag(self.imp_unions[u_cid][0], cid))
             data_flags.append(self._cal_data_value_flag(self.imp_unions[u_cid][1], cid))
             time_cm_flags.append(self._cal_cm_time_flag(cid))
-            time_cp_flags.append(self._cal_cp_time_flag(cid))
-            if u <= 0:
-                strategy_per_client[cid] = 0.0
+            f_flag = cmp_flags[-1] * pay_vector[i]  # 2024-3-3 需求有变，去掉0决策
+            if f_flag >= f_max:
+                strategy_per_client[cid] = f_max
+            elif f_flag <= f_min:
+                strategy_per_client[cid] = f_min
             else:
-                f_flag = cmp_flags[-1] * pay_vector[i]
-                if f_flag >= f_max:
-                    strategy_per_client[cid] = f_max
-                elif f_flag <= f_min:
-                    strategy_per_client[cid] = f_min
-                else:
-                    strategy_per_client[cid] = f_flag
+                strategy_per_client[cid] = f_flag  # 并且决策变量f*代替一阶段优化问题的f
+            time_cp_flags.append(self._cal_cp_time_flag(cid) / strategy_per_client[cid])
         # 第一阶段，求出当前盟主的均衡解, 调用minimize函数时传入额外参数
         x0 = np.concatenate((pay_vector, band_vector))
         flags = {'cp_value': cmp_flags, 'data_value': data_flags, 'time_cm': time_cm_flags, 'time_cp': time_cp_flags}
@@ -537,12 +534,12 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
             optimal_fun = solution.fun
         else:
             print("Optimal solution for union of {} failed.".format(u_cid))
-        print(strategy_per_client)
-        for i, cid in enumerate(self.client_unions[u_cid]):  # 每位成员最终的分配值(一阶段的均衡解)
-            if strategy_per_client[cid] > 0:
-                self.client_rewards[cid] = (pay_vector[i], band_vector[i])
-            else:
-                self.client_rewards[cid] = (0, 0)  # 联盟内部均衡解不淘汰
+        # print(strategy_per_client)  # 2024-3-3 由于已经没有0决策，以下弃用
+        # for i, cid in enumerate(self.client_unions[u_cid]):  # 每位成员最终的分配值(一阶段的均衡解)
+        #     if strategy_per_client[cid] > 0:
+        #         self.client_rewards[cid] = (pay_vector[i], band_vector[i])
+        #     else:
+        #         self.client_rewards[cid] = (0, 0)  # 联盟内部均衡解不淘汰
                 # self.client_banned_List[cid] = 3  # 因为均衡解为0被剔除(弃用)
 
     def _setup_clients(self, train_data_local_dict, test_data_local_dict):
