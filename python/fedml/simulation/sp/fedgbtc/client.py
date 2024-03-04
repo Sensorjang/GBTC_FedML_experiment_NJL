@@ -27,12 +27,18 @@ class Client:
         # self.model_trainer.set_id(client_idx)
 
     def share_data_up(self, share_rate):
-        indices = np.random.permutation(len(self.local_training_data.dataset))[
-                  :int(len(self.local_training_data.dataset) * share_rate)]
+        indices = np.random.permutation(len(self.local_training_data))[
+                  :int(len(self.local_training_data) * share_rate)]
         shared_data_list = []
         shared_targets_list = []
+
+        #输出share_rate、len(self.local_training_data)、indices
+        print("share_rate:", share_rate)
+        print("len(self.local_training_data):", len(self.local_training_data))
+        print("indices:", indices)
+
         for idx in indices:
-            data, target = self.local_training_data.dataset[idx]
+            data, target = self.local_training_data[idx]
 
             # 检查data是否为Tensor，如果不是，则尝试转换
             if not isinstance(data, torch.Tensor):

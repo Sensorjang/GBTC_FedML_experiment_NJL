@@ -4,7 +4,7 @@ common_args:
   excel_save_path: "D:\\"
 
 data_args:
-  dataset: "cifar10"
+  dataset: "mnist"
   data_cache_dir: ~/fedml_data
   partition_method: "homo"
   partition_alpha: 0
@@ -21,7 +21,7 @@ data_args:
 #  fed_cifar100  resnet18_gn
 
 model_args:
-  model: "cnn_web"
+  model: "cnn"
 
 train_args:
   federated_optimizer: "FedGBTC"

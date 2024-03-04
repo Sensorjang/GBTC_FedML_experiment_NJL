@@ -42,10 +42,7 @@ pip install .
 然后执行[GBTC_experiment](python/examples/simulation/GBTC_experiment)下的各个python文件即可：<br/>
 Then execute the various Python files under [GBTC_experiment](python/examples/simulation/GBTC_experiment) to:<br/>
 ```bash
-torch_fair_step_by_step_example.py
 torch_fedavg_step_by_step_example.py
-torch_fedprox_step_by_step_example.py
-torch_fedcs_step_by_step_example.py
 torch_GBTC_step_by_step_example.py
 ```
 程序会自动绘制图像，并且在控制台输出绘图坐标信息<br/>

@@ -646,6 +646,10 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
 
             mlops.log_round_info(self.args.comm_round, round_idx)
 
+            round_ws.append([round_idx,
+                             train_loss,
+                             train_acc,
+                             time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())])
 
             # 保存Excel文件到self.args.excel_save_path+文件名
             wb.save(
