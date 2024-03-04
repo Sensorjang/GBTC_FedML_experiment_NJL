@@ -26,19 +26,14 @@ class Client:
         self.local_sample_number = local_sample_number
         # self.model_trainer.set_id(client_idx)
 
-    def share_data_up(self, share_rate):
-        indices = np.random.permutation(len(self.local_training_data))[
-                  :int(len(self.local_training_data) * share_rate)]
+    def share_data_up(self, share_rate):  # 现在传入的只会是dataloader对象
+        indices = np.random.permutation(len(self.local_training_data.dataset))[
+                  :int(len(self.local_training_data.dataset) * share_rate)]
         shared_data_list = []
         shared_targets_list = []
-
-        #输出share_rate、len(self.local_training_data)、indices
-        print("share_rate:", share_rate)
-        print("len(self.local_training_data):", len(self.local_training_data))
-        print("indices:", indices)
-
+        # 从原始dataset中抽取对应的数据和标签
         for idx in indices:
-            data, target = self.local_training_data[idx]
+            data, target = self.local_training_data.dataset[idx]
 
             # 检查data是否为Tensor，如果不是，则尝试转换
             if not isinstance(data, torch.Tensor):
@@ -51,7 +46,7 @@ class Client:
             if data.nelement() == 0:  # 或者使用data.numel() == 0
                 print(f"Warning: Empty data item at index {idx}. Skipping this item.")
                 continue
-
+            # 将列表转换为张量
             shared_data_list.append(data)
             shared_targets_list.append(target)
 
@@ -59,6 +54,7 @@ class Client:
         if not shared_data_list or not shared_targets_list:
             raise ValueError("All shared data items are empty. Please check the dataset.")
 
+        # 创建新的TensorDataset
         shared_data = torch.stack(shared_data_list)
         shared_targets = torch.stack(shared_targets_list)
         shared_dataset = TensorDataset(shared_data, shared_targets)
@@ -66,7 +62,8 @@ class Client:
         return shared_dataset, len(shared_data_list)
 
     def get_shared_data(self, cid, share_training_data, share_number):
-        self.share_training_data_dict[cid] = (share_training_data, share_number)
+        if share_number > 0:  # 防止后面合并到空dataset
+            self.share_training_data_dict[cid] = (share_training_data, share_number)
 
     def update_share_data(self):
         all_datasets = [self.local_training_data.dataset]

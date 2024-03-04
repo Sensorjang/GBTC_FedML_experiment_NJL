@@ -10,7 +10,8 @@ from .stackoverflow_lr.data_loader import load_partition_data_federated_stackove
 from .FederatedEMNIST.data_loader import load_partition_data_federated_emnist
 from .ImageNet.data_loader import load_partition_data_ImageNet
 from .Landmarks.data_loader import load_partition_data_landmarks
-from .MNIST.data_loader import load_partition_data_mnist, download_mnist
+from .MNIST.data_loader import load_partition_data_mnist
+from .MNIST.efficient_loader import efficient_load_partition_data_mnist
 from .cifar10.data_loader import load_partition_data_cifar10
 from .cifar10.efficient_loader import efficient_load_partition_data_cifar10
 from .cifar100.data_loader import load_partition_data_cifar100
@@ -260,10 +261,79 @@ def load_synthetic_data(args):
         full_batch = False
 
     if dataset_name == "mnist":
-        download_mnist(args.data_cache_dir)
-        logging.info("load_data. dataset_name = %s" % dataset_name)
+        if hasattr(args, "synthetic_data_url") or hasattr(args, "private_local_data"):
+            if hasattr(args, "synthetic_data_url"):
+                args.private_local_data = ""
+            else:
+                args.synthetic_data_url = ""
+            if args.process_id != 0:
+                args.data_cache_dir = os.path.join(
+                    args.data_cache_dir,
+                    "run_Id_%s" % args.run_id,
+                    "edgeNums_%s" % (args.client_num_in_total),
+                    args.dataset,
+                    "edgeId_%s" % args.client_id,
+                )
+            (
+                train_data_num,
+                test_data_num,
+                train_data_global,
+                test_data_global,
+                train_data_local_num_dict,
+                train_data_local_dict,
+                test_data_local_dict,
+                class_num,
+            ) = efficient_load_partition_data_mnist(
+                args,
+                args.dataset,
+                args.data_cache_dir,
+                args.partition_method,
+                args.partition_alpha,
+                args.client_num_in_total,
+                args.batch_size,
+                args.process_id,
+                args.synthetic_data_url,
+                args.private_local_data
+            )
+
+            if centralized:
+                train_data_local_num_dict = {
+                    0: sum(user_train_data_num for user_train_data_num in train_data_local_num_dict.values())
+                }
+                train_data_local_dict = {
+                    0: [batch for cid in sorted(train_data_local_dict.keys()) for batch in
+                        train_data_local_dict[cid]]
+                }
+                test_data_local_dict = {
+                    0: [batch for cid in sorted(test_data_local_dict.keys()) for batch in test_data_local_dict[cid]]
+                }
+                args.client_num_in_total = 1
+
+            if full_batch:
+                train_data_global = combine_batches(train_data_global)
+                test_data_global = combine_batches(test_data_global)
+                train_data_local_dict = {
+                    cid: combine_batches(train_data_local_dict[cid]) for cid in train_data_local_dict.keys()
+                }
+                test_data_local_dict = {
+                    cid: combine_batches(test_data_local_dict[cid]) for cid in test_data_local_dict.keys()
+                }
+                args.batch_size = args_batch_size
+
+            dataset = [
+                train_data_num,
+                test_data_num,
+                train_data_global,
+                test_data_global,
+                train_data_local_num_dict,
+                train_data_local_dict,
+                test_data_local_dict,
+                class_num,
+            ]
+            return dataset, class_num
+        else:
+            data_loader = efficient_load_partition_data_mnist
         (
-            client_num,
             train_data_num,
             test_data_num,
             train_data_global,
@@ -272,17 +342,15 @@ def load_synthetic_data(args):
             train_data_local_dict,
             test_data_local_dict,
             class_num,
-        ) = load_partition_data_mnist(
+        ) = data_loader(
             args,
+            args.dataset,
+            args.data_cache_dir,
+            args.partition_method,
+            args.partition_alpha,
+            args.client_num_in_total,
             args.batch_size,
-            train_path=os.path.join(args.data_cache_dir, "MNIST", "train"),
-            test_path=os.path.join(args.data_cache_dir, "MNIST", "test"),
         )
-        """
-        For shallow NN or linear models, 
-        we uniformly sample a fraction of clients each round (as the original FedAvg paper)
-        """
-        args.client_num_in_total = client_num
 
     elif dataset_name == "femnist":
         logging.info("load_data. dataset_name = %s" % dataset_name)

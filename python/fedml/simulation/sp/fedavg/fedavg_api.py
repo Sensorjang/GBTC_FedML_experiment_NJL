@@ -14,8 +14,6 @@ from torch.utils.data import DataLoader
 
 from .client import Client
 import matplotlib.pyplot as plt
-
-global_client_num_in_total = 30
 # 记录每轮的信息
 accuracy_list = []
 loss_list = []
@@ -23,7 +21,7 @@ train_time = []
 
 # 参数0
 # 统计global_client_num_in_total个客户每个人的被选择次数
-client_selected_times = [0 for i in range(global_client_num_in_total)]
+# client_selected_times = [0 for i in range(global_client_num_in_total)]
 plt.figure(1, figsize=(10, 5))
 
 # 创建一个新的Excel工作簿
@@ -110,14 +108,15 @@ class FedAvgAPI(object):
         self.train_data_num_in_total = train_data_num
         self.test_data_num_in_total = test_data_num
         # 参数1
-        self.client_num_in_total = global_client_num_in_total #added
+        self.client_num_in_total = 50
         self.client_list = []
         self.train_data_local_num_dict = self.get_local_sample_num(train_data_local_dict)
         self.train_data_local_dict = train_data_local_dict
         self.test_data_local_dict = test_data_local_dict
 
         # 历史联盟(客户历史所参与的,还没有盟主，字典存放联盟的id-客户对其偏好值)
-        self.trust_threshold = 20
+        self.trust_threshold = 70
+        self.member_tolerance = 3
         self.his_client_unions = {i: {} for i in range(self.client_num_in_total)}
         logging.info("model = {}".format(model))
         self.model_trainer = create_model_trainer(model, args)
@@ -129,28 +128,11 @@ class FedAvgAPI(object):
         )
 
     # 返回的样本量信息未对齐，暂时直接查询
-    def get_local_sample_num(self, train_data_local_dict):
+    def get_local_sample_num(self, train_data_local_dict):  # 现在传入的只会是dataloader对象
         train_data_local_num_dict = {}
         for cid in range(self.client_num_in_total):
             train_data = train_data_local_dict[cid]
-            if isinstance(train_data, DataLoader):
-                # DataLoader类型，直接获取dataset的长度
-                sample_num = len(train_data.dataset)
-            elif isinstance(train_data, list):
-                # 如果train_data是列表类型，假设它是批处理后的数据
-                sample_num = 0  # 初始化样本数
-                for data, label in train_data:
-                    # 假设data是Tensor，累加每个批次的样本数
-                    if isinstance(data, torch.Tensor):
-                        sample_num += data.size(0)  # 第一个维度通常是批次中的样本数
-                        print(data.size(0))
-                    else:
-                        print(f"Unexpected data type in batch: {type(data)}")
-                        # 如果data不是Tensor，这可能需要特殊处理或抛出错误
-                print(sample_num)
-            else:
-                # 如果train_data既不是DataLoader也不是list，抛出错误
-                raise TypeError(f"Unsupported train data type: {type(train_data)}.")
+            sample_num = len(train_data.dataset)
             train_data_local_num_dict[cid] = sample_num
         return train_data_local_num_dict
 
@@ -279,16 +261,14 @@ class FedAvgAPI(object):
                     self.his_client_unions[cid].pop(uid)
                     client_selfish_list.append(cid)  # 因为社会信任不足被剔除
                     union.remove(cid)
+
         # 清除自私集群的联盟
-        # ban_union_key_list = []
         for uid, union in unions.items():
-            if len(union) == 1:
-                cid = union[0]
-                self.his_client_unions[cid].pop(uid)
-                client_selfish_list.append(cid)  # 因为社会信任不足被剔除
-                # ban_union_key_list.append(uid)
-        # print(ban_union_key_list)
-        # unions.ban_union(ban_union_key_list)
+            if len(union) <= self.member_tolerance:
+                for cid in union:
+                    self.his_client_unions[cid].pop(uid)
+                    client_selfish_list.append(cid)
+
         return client_selfish_list
 
 
@@ -473,7 +453,6 @@ class FedAvgAPI(object):
             if self.test_data_local_dict[client_idx] is None:
                 continue
             client.update_local_dataset(
-                0,
                 self.train_data_local_dict[client_idx],
                 self.test_data_local_dict[client_idx],
                 self.train_data_local_num_dict[client_idx],

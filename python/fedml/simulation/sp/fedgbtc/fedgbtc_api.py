@@ -176,28 +176,11 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
 
         self._setup_clients(train_data_local_dict, test_data_local_dict)
 
-    def get_local_sample_num(self, train_data_local_dict):
+    def get_local_sample_num(self, train_data_local_dict):  # 现在传入的只会是dataloader对象
         train_data_local_num_dict = {}
         for cid in range(self.client_num_in_total):
             train_data = train_data_local_dict[cid]
-            if isinstance(train_data, DataLoader):
-                # DataLoader类型，直接获取dataset的长度
-                sample_num = len(train_data.dataset)
-            elif isinstance(train_data, list):
-                # 如果train_data是列表类型，假设它是批处理后的数据
-                sample_num = 0  # 初始化样本数
-                for data, label in train_data:
-                    # 假设data是Tensor，累加每个批次的样本数
-                    if isinstance(data, torch.Tensor):
-                        sample_num += data.size(0)  # 第一个维度通常是批次中的样本数
-                        print(data.size(0))
-                    else:
-                        print(f"Unexpected data type in batch: {type(data)}")
-                        # 如果data不是Tensor，这可能需要特殊处理或抛出错误
-                print(sample_num)
-            else:
-                # 如果train_data既不是DataLoader也不是list，抛出错误
-                raise TypeError(f"Unsupported train data type: {type(train_data)}.")
+            sample_num = len(train_data.dataset)
             train_data_local_num_dict[cid] = sample_num
         return train_data_local_num_dict
 
@@ -239,7 +222,6 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         :return: 信任图，包含不信任和不认识关系的随机值，对角线元素为0
         """
         distrust_probability = self.common_params['distrust_probability']
-        unknown_probability = self.common_params['unknown_probability']
         value_range = self.common_params['trust_range']
         shape = (self.client_num_in_total, self.client_num_in_total)
         min_value, max_value = value_range

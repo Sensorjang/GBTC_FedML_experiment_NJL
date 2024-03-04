@@ -1,6 +1,6 @@
 import logging
 import torch.nn as nn
-from fedml.model.cv.cnn import CNN_DropOut, CNN_WEB
+from fedml.model.cv.cnn import CNN_DropOut, CNN_WEB, CNN_OriginalFedAvg
 from fedml.model.cv.darts import genotypes
 from fedml.model.cv.darts.model import NetworkCIFAR
 from fedml.model.cv.darts.model_search import Network

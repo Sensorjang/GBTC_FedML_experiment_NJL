@@ -57,7 +57,7 @@ class CNN_OriginalFedAvg(torch.nn.Module):
         # self.softmax = nn.Softmax(dim=1)
 
     def forward(self, x):
-        x = torch.unsqueeze(x, 1)
+        # x = torch.unsqueeze(x, 1)  # 现在读入的mnist数据已是dataloader类型(经过内部batch)
         x = self.conv2d_1(x)
         x = self.relu(x)
         x = self.max_pooling(x)
@@ -126,7 +126,7 @@ class CNN_DropOut(torch.nn.Module):
         # self.softmax = nn.Softmax(dim=1)
 
     def forward(self, x):
-        x = torch.unsqueeze(x, 1)
+        # x = torch.unsqueeze(x, 1)  # 现在读入的mnist数据已是dataloader类型(经过内部batch)
         x = self.conv2d_1(x)
         x = self.relu(x)
         x = self.conv2d_2(x)

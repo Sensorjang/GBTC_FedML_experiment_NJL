@@ -1,243 +1,312 @@
-import json
-import os
-import random
-
-import numpy as np
-import wget
-from ...ml.engine import ml_engine_adapter
-
-cwd = os.getcwd()
-
-import zipfile
-
-from ...constants import FEDML_DATA_MNIST_URL
 import logging
+import numpy as np
+import torch
+import torch.utils.data as data
+import torchvision.transforms as transforms
+from .datasets import MNIST_truncated
 
 
-def download_mnist(data_cache_dir):
-    if not os.path.exists(data_cache_dir):
-        os.makedirs(data_cache_dir)
-
-    file_path = os.path.join(data_cache_dir, "MNIST.zip")
-    logging.info(file_path)
-
-    # Download the file (if we haven't already)
-    if not os.path.exists(file_path):
-        wget.download(FEDML_DATA_MNIST_URL, out=file_path)
-
-    with zipfile.ZipFile(file_path, "r") as zip_ref:
-        zip_ref.extractall(data_cache_dir)
-
-
-def read_data(train_data_dir, test_data_dir):
-    """parses data in given train and test data directories
-
-    assumes:
-    - the data in the input directories are .json files with
-        keys 'users' and 'user_data'
-    - the set of train set users is the same as the set of test set users
-
-    Return:
-        clients: list of non-unique client ids
-        groups: list of group ids; empty list if none found
-        train_data: dictionary of train data
-        test_data: dictionary of test data
-    """
-    clients = []
-    groups = []
-    train_data = {}
-    test_data = {}
-
-    train_files = os.listdir(train_data_dir)
-    train_files = [f for f in train_files if f.endswith(".json")]
-    for f in train_files:
-        file_path = os.path.join(train_data_dir, f)
-        with open(file_path, "r") as inf:
-            cdata = json.load(inf)
-        clients.extend(cdata["users"])
-        if "hierarchies" in cdata:
-            groups.extend(cdata["hierarchies"])
-        train_data.update(cdata["user_data"])
-
-    test_files = os.listdir(test_data_dir)
-    test_files = [f for f in test_files if f.endswith(".json")]
-    for f in test_files:
-        file_path = os.path.join(test_data_dir, f)
-        with open(file_path, "r") as inf:
-            cdata = json.load(inf)
-        test_data.update(cdata["user_data"])
-
-    clients = sorted(cdata["users"])
-
-    return clients, groups, train_data, test_data
+# generate the non-IID distribution for all methods
+def read_data_distribution(
+    filename="./data_preprocessing/non-iid-distribution/MNIST/distribution.txt",
+):
+    distribution = {}
+    with open(filename, "r") as data:
+        for x in data.readlines():
+            if "{" != x[0] and "}" != x[0]:
+                tmp = x.split(":")
+                if "{" == tmp[1].strip():
+                    first_level_key = int(tmp[0])
+                    distribution[first_level_key] = {}
+                else:
+                    second_level_key = int(tmp[0])
+                    distribution[first_level_key][second_level_key] = int(
+                        tmp[1].strip().replace(",", "")
+                    )
+    return distribution
 
 
-def batch_data(args, data, batch_size):
-
-    """
-    data is a dict := {'x': [numpy array], 'y': [numpy array]} (on one client)
-    returns x, y, which are both numpy array of length: batch_size
-    """
-    data_x = data["x"]
-    data_y = data["y"]
-
-    # randomly shuffle data
-    np.random.seed(100)
-    rng_state = np.random.get_state()
-    np.random.shuffle(data_x)
-    np.random.set_state(rng_state)
-    np.random.shuffle(data_y)
-
-    # loop through mini-batches
-    batch_data = list()
-    for i in range(0, len(data_x), batch_size):
-        batched_x = data_x[i : i + batch_size]
-        batched_y = data_y[i : i + batch_size]
-        batched_x, batched_y = ml_engine_adapter.convert_numpy_to_ml_engine_data_format(args, batched_x, batched_y)
-        batch_data.append((batched_x, batched_y))
-    return batch_data
+def read_net_dataidx_map(
+    filename="./data_preprocessing/non-iid-distribution/MNIST/net_dataidx_map.txt",
+):
+    net_dataidx_map = {}
+    with open(filename, "r") as data:
+        for x in data.readlines():
+            if "{" != x[0] and "}" != x[0] and "]" != x[0]:
+                tmp = x.split(":")
+                if "[" == tmp[-1].strip():
+                    key = int(tmp[0])
+                    net_dataidx_map[key] = []
+                else:
+                    tmp_array = x.split(",")
+                    net_dataidx_map[key] = [int(i.strip()) for i in tmp_array]
+    return net_dataidx_map
 
 
-def load_partition_data_mnist_by_device_id(batch_size, device_id, train_path="MNIST_mobile", test_path="MNIST_mobile"):
-    train_path += os.path.join("/", device_id, "train")
-    test_path += os.path.join("/", device_id, "test")
-    return load_partition_data_mnist(batch_size, train_path, test_path)
+def record_net_data_stats(y_train, net_dataidx_map):
+    net_cls_counts = {}
 
-def load_partition_data_mnist(args, batch_size, train_path=os.path.join(os.getcwd(), "MNIST", "train"),
-                              test_path=os.path.join(os.getcwd(), "MNIST", "test")):
-    users, groups, train_data, test_data = read_data(train_path, test_path)
+    for net_i, dataidx in net_dataidx_map.items():
+        unq, unq_cnt = np.unique(y_train[dataidx], return_counts=True)
+        tmp = {unq[i]: unq_cnt[i] for i in range(len(unq))}
+        net_cls_counts[net_i] = tmp
+    logging.debug("Data statistics: %s" % str(net_cls_counts))
+    return net_cls_counts
 
-    if len(groups) == 0:
-        groups = [None for _ in users]
 
-    # NIID可控逻辑
+class Cutout(object):
+    def __init__(self, length):
+        self.length = length
 
-    # Compute the number of data points in each client
-    client_data_num = {}
-    for u in users:
-        client_data_num[u] = len(train_data[u]["x"])
+    def __call__(self, img):
+        h, w = img.size(1), img.size(2)
+        mask = np.ones((h, w), np.float32)
+        y = np.random.randint(h)
+        x = np.random.randint(w)
 
-    # Sort the clients by data point count in descending order
-    # sorted_clients = sorted(client_data_num, key=client_data_num.get, reverse=True)
+        y1 = np.clip(y - self.length // 2, 0, h)
+        y2 = np.clip(y + self.length // 2, 0, h)
+        x1 = np.clip(x - self.length // 2, 0, w)
+        x2 = np.clip(x + self.length // 2, 0, w)
 
-    # 计算排序的数据量
-    sort_size = int(len(client_data_num) * args.experiment_niid_level)
+        mask[y1:y2, x1:x2] = 0.0
+        mask = torch.from_numpy(mask)
+        mask = mask.expand_as(img)
+        img *= mask
+        return img
 
-    # 对前70%的数据进行排序
-    sorted_clients = sorted(client_data_num, key=client_data_num.get, reverse=True)[:sort_size]
 
-    # 对剩下的30%的数据进行随机排序
-    unsorted_clients = list(set(client_data_num.keys()) - set(sorted_clients))
-    random.shuffle(unsorted_clients)
+def _data_transforms_mnist():
+    MNIST_MEAN = [0.1307, ]
+    MNIST_STD = [0.3081, ]
 
-    # 随机交叉合并排序后的数据和未排序的数据
-    result = []
-    num_sorted = 0
-    num_unsorted = 0
-    while num_sorted < len(sorted_clients) and num_unsorted < len(unsorted_clients):
-        if random.random() < 0.5:
-            result.append(sorted_clients[num_sorted])
-            num_sorted += 1
-        else:
-            result.append(unsorted_clients[num_unsorted])
-            num_unsorted += 1
+    train_transform = transforms.Compose(
+        [
+            transforms.ToPILImage(),
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(MNIST_MEAN, MNIST_STD),
+        ]
+    )
 
-    # 将剩下的数据添加到结果中
-    result += sorted_clients[num_sorted:] + unsorted_clients[num_unsorted:]
+    train_transform.transforms.append(Cutout(16))
 
-    # NIID可控逻辑^^^^
+    valid_transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(MNIST_MEAN, MNIST_STD),
+        ]
+    )
 
-    # Initialize the variables to keep track of the data
-    train_data_num = 0
-    test_data_num = 0
+    return train_transform, valid_transform
+
+
+def load_mnist_data(datadir):
+    train_transform, test_transform = _data_transforms_mnist()
+
+    cifar10_train_ds = MNIST_truncated(
+        datadir, train=True, download=True, transform=train_transform
+    )
+    cifar10_test_ds = MNIST_truncated(
+        datadir, train=False, download=True, transform=test_transform
+    )
+
+    X_train, y_train = cifar10_train_ds.data, cifar10_train_ds.target
+    X_test, y_test = cifar10_test_ds.data, cifar10_test_ds.target
+
+    return (X_train, y_train, X_test, y_test)
+
+
+def partition_data(dataset, datadir, partition, n_nets, alpha):
+    np.random.seed(10)
+    logging.info("*********partition data***************")
+    X_train, y_train, X_test, y_test = load_mnist_data(datadir)
+    n_train = X_train.shape[0]
+    # n_test = X_test.shape[0]
+
+    if partition == "homo":
+        total_num = n_train
+        idxs = np.random.permutation(total_num)
+        batch_idxs = np.array_split(idxs, n_nets)
+        net_dataidx_map = {i: batch_idxs[i] for i in range(n_nets)}
+
+    elif partition == "hetero":
+        min_size = 0
+        K = 10
+        N = y_train.shape[0]
+        logging.info("N = " + str(N))
+        net_dataidx_map = {}
+
+        while min_size < 10:
+            idx_batch = [[] for _ in range(n_nets)]
+            # for each class in the dataset
+            for k in range(K):
+                idx_k = np.where(y_train == k)[0]
+                np.random.shuffle(idx_k)
+                proportions = np.random.dirichlet(np.repeat(alpha, n_nets))
+                ## Balance
+                proportions = np.array(
+                    [
+                        p * (len(idx_j) < N / n_nets)
+                        for p, idx_j in zip(proportions, idx_batch)
+                    ]
+                )
+                proportions = proportions / proportions.sum()
+                proportions = (np.cumsum(proportions) * len(idx_k)).astype(int)[:-1]
+                idx_batch = [
+                    idx_j + idx.tolist()
+                    for idx_j, idx in zip(idx_batch, np.split(idx_k, proportions))
+                ]
+                min_size = min([len(idx_j) for idx_j in idx_batch])
+
+        for j in range(n_nets):
+            np.random.shuffle(idx_batch[j])
+            net_dataidx_map[j] = idx_batch[j]
+
+    elif partition == "hetero-fix":
+        dataidx_map_file_path = (
+            "./data_preprocessing/non-iid-distribution/MNIST/net_dataidx_map.txt"
+        )
+        net_dataidx_map = read_net_dataidx_map(dataidx_map_file_path)
+
+    if partition == "hetero-fix":
+        distribution_file_path = (
+            "./data_preprocessing/non-iid-distribution/MNIST/distribution.txt"
+        )
+        traindata_cls_counts = read_data_distribution(distribution_file_path)
+    else:
+        traindata_cls_counts = record_net_data_stats(y_train, net_dataidx_map)
+
+    return X_train, y_train, X_test, y_test, net_dataidx_map, traindata_cls_counts
+
+
+# for centralized training
+def get_dataloader(dataset, datadir, train_bs, test_bs, dataidxs=None):
+    return get_dataloader_MNIST(datadir, train_bs, test_bs, dataidxs)
+
+
+# for local devices
+def get_dataloader_test(
+    dataset, datadir, train_bs, test_bs, dataidxs_train, dataidxs_test
+):
+    return get_dataloader_test_CIFAR10(
+        datadir, train_bs, test_bs, dataidxs_train, dataidxs_test
+    )
+
+
+def get_dataloader_MNIST(datadir, train_bs, test_bs, dataidxs=None):
+    dl_obj = MNIST_truncated
+
+    transform_train, transform_test = _data_transforms_mnist()
+
+    train_ds = dl_obj(
+        datadir, dataidxs=dataidxs, train=True, transform=transform_train, download=True
+    )
+    test_ds = dl_obj(datadir, train=False, transform=transform_test, download=True)
+
+    train_dl = data.DataLoader(
+        dataset=train_ds, batch_size=train_bs, shuffle=True, drop_last=True
+    )
+    test_dl = data.DataLoader(
+        dataset=test_ds, batch_size=test_bs, shuffle=False, drop_last=True
+    )
+
+    return train_dl, test_dl
+
+
+def get_dataloader_test_CIFAR10(
+    datadir, train_bs, test_bs, dataidxs_train=None, dataidxs_test=None
+):
+    dl_obj = MNIST_truncated
+
+    transform_train, transform_test = _data_transforms_mnist()
+
+    train_ds = dl_obj(
+        datadir,
+        dataidxs=dataidxs_train,
+        train=True,
+        transform=transform_train,
+        download=True,
+    )
+    test_ds = dl_obj(
+        datadir,
+        dataidxs=dataidxs_test,
+        train=False,
+        transform=transform_test,
+        download=True,
+    )
+
+    train_dl = data.DataLoader(
+        dataset=train_ds, batch_size=train_bs, shuffle=True, drop_last=True
+    )
+    test_dl = data.DataLoader(
+        dataset=test_ds, batch_size=test_bs, shuffle=False, drop_last=True
+    )
+
+    return train_dl, test_dl
+
+def load_partition_data_mnist(
+    args,
+    dataset,
+    data_dir,
+    partition_method,
+    partition_alpha,
+    client_number,
+    batch_size,
+    n_proc_in_silo=0,
+):
+    (
+        X_train,
+        y_train,
+        X_test,
+        y_test,
+        net_dataidx_map,
+        traindata_cls_counts,
+    ) = partition_data(
+        dataset, data_dir, partition_method, client_number, partition_alpha
+    )
+    class_num = len(np.unique(y_train))
+    logging.info("traindata_cls_counts = " + str(traindata_cls_counts))
+    train_data_num = sum([len(net_dataidx_map[r]) for r in range(client_number)])
+
+    train_data_global, test_data_global = get_dataloader(
+        dataset, data_dir, batch_size, batch_size
+    )
+    logging.info("train_dl_global number = " + str(len(train_data_global)))
+    logging.info("test_dl_global number = " + str(len(test_data_global)))
+    test_data_num = len(test_data_global)
+
+    # get local dataset
+    data_local_num_dict = dict()
     train_data_local_dict = dict()
     test_data_local_dict = dict()
-    train_data_local_num_dict = dict()
-    train_data_global = list()
-    test_data_global = list()
 
-    logging.info("loading data...")
-    for client_idx, client_id in enumerate(result):
-        g = groups[users.index(client_id)]
-        user_train_data_num = client_data_num[client_id]
-        user_test_data_num = len(test_data[client_id]["x"])
-        train_data_num += user_train_data_num
-        test_data_num += user_test_data_num
-        train_data_local_num_dict[client_idx] = user_train_data_num
+    for client_idx in range(client_number):
+        dataidxs = net_dataidx_map[client_idx]
+        local_data_num = len(dataidxs)
+        data_local_num_dict[client_idx] = local_data_num
+        logging.info(
+            "client_idx = %d, local_sample_number = %d" % (client_idx, local_data_num)
+        )
 
-        # transform to batches
-        train_batch = batch_data(args, train_data[client_id], batch_size)
-        test_batch = batch_data(args, test_data[client_id], batch_size)
-
-        # index using client index
-        train_data_local_dict[client_idx] = train_batch
-        test_data_local_dict[client_idx] = test_batch
-        train_data_global += train_batch
-        test_data_global += test_batch
-
-    logging.info("finished the loading data")
-
-    client_num = client_idx
-    class_num = 10
-
+        # training batch size = 64; algorithms batch size = 32
+        train_data_local, test_data_local = get_dataloader(
+            dataset, data_dir, batch_size, batch_size, dataidxs
+        )
+        logging.info(
+            "client_idx = %d, batch_num_train_local = %d, batch_num_test_local = %d"
+            % (client_idx, len(train_data_local), len(test_data_local))
+        )
+        train_data_local_dict[client_idx] = train_data_local
+        test_data_local_dict[client_idx] = test_data_local
     return (
-        client_num,
         train_data_num,
         test_data_num,
         train_data_global,
         test_data_global,
-        train_data_local_num_dict,
+        data_local_num_dict,
         train_data_local_dict,
         test_data_local_dict,
         class_num,
     )
-#
-# def load_partition_data_mnist(
-#     args, batch_size, train_path=os.path.join(os.getcwd(), "MNIST", "train"),
-#         test_path=os.path.join(os.getcwd(), "MNIST", "test")
-# ):
-#     users, groups, train_data, test_data = read_data(train_path, test_path)
-#
-#     if len(groups) == 0:
-#         groups = [None for _ in users]
-#     train_data_num = 0
-#     test_data_num = 0
-#     train_data_local_dict = dict()
-#     test_data_local_dict = dict()
-#     train_data_local_num_dict = dict()
-#     train_data_global = list()
-#     test_data_global = list()
-#     client_idx = 0
-#     logging.info("loading data...")
-#     for u, g in zip(users, groups):
-#         user_train_data_num = len(train_data[u]["x"])
-#         user_test_data_num = len(test_data[u]["x"])
-#         train_data_num += user_train_data_num
-#         test_data_num += user_test_data_num
-#         train_data_local_num_dict[client_idx] = user_train_data_num
-#
-#         # transform to batches
-#         train_batch = batch_data(args, train_data[u], batch_size)
-#         test_batch = batch_data(args, test_data[u], batch_size)
-#
-#         # index using client index
-#         train_data_local_dict[client_idx] = train_batch
-#         test_data_local_dict[client_idx] = test_batch
-#         train_data_global += train_batch
-#         test_data_global += test_batch
-#         client_idx += 1
-#     logging.info("finished the loading data")
-#     client_num = client_idx
-#     class_num = 10
-#
-#     return (
-#         client_num,
-#         train_data_num,
-#         test_data_num,
-#         train_data_global,
-#         test_data_global,
-#         train_data_local_num_dict,
-#         train_data_local_dict,
-#         test_data_local_dict,
-#         class_num,
-#     )
