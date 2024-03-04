@@ -19,7 +19,6 @@ from .client import Client
 import openpyxl
 import time
 
-global_num_clients = 30  # 不要太多了，否则求解时间太长
 # 常超参数
 interval_params = {
     'miu': (15, 20),  # 处理单位样本所需的CPU周期数
@@ -33,11 +32,14 @@ interval_params = {
     'rho': 8,  # 阴影衰落， 对数正态分布的标准差
     'e': 1e-28,  # 计算芯片组有效电容参数
     'd': (0, 0.08),  # 客户端与联邦服务器的物理距离/km
-    'k': 10,  # 初始联盟的个数
+    'k': 30,  # 初始联盟的个数
     'omega': 900,  # 联盟主对支付成本与训练时间的权衡系数,
     'lambda_cm': (1e-8, 1e-7),  # 客户单位通信开销范围
     'lambda_cp': (1e-8, 1e-7),  # 客户单位计算开销范围
-    'trust_threshold': 20,  # 联盟信任阈值（低于阈值的剔除）
+    'trust_range': (0, 10),  # 信任值范围
+    'distrust_probability': 0.01,  # 完全不信任的概率
+    'trust_threshold': 70,  # 联盟信任阈值（低于阈值的剔除）
+    'member_tolerance': 3,  # 联盟成员数量的容忍度（低于阈值的剔除）
     'pay_range': (10, 100),  # 盟主支付元素的范围
     'data_imp': (0.6, 0.9),  # 盟主对数据质量的重视程度
     'data_share': (0.05, 0.1),  # 成员对盟主的数据共享率
@@ -142,7 +144,7 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         self.train_data_num_in_total = train_data_num
         self.test_data_num_in_total = test_data_num
         self.class_num = class_num
-        self.client_num_in_total = global_num_clients
+        self.client_num_in_total = 50 # 不要太多了，否则求解时间太长
         self.client_list = []  # 原始的客户集合（全部），不以联盟区分
         self.train_data_local_num_dict = self.get_local_sample_num(train_data_local_dict)
         self.train_data_local_dict = train_data_local_dict
@@ -215,6 +217,8 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
                 self.common_params['data_imp'] = value
             elif key == 'data_share':  # 数据共享率范围，转存到self
                 self.common_params['data_share'] = value
+            elif key == 'trust_range':  # 信任值范围，转存到self
+                self.common_params['trust_range'] = value
             elif isinstance(value, tuple):
                 for i in range(self.client_num_in_total):
                     self.client_params[i][key] = np.random.uniform(*value)
@@ -225,22 +229,29 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
             self.client_params[client.client_idx]['D'] = client.get_sample_number()
         self.common_params['I'] = self.args.epochs
 
-    def create_trust_graph(self, value_range=(1, 10), distrust_probability=0.01):
+    def create_trust_graph(self):
         """
-        修改后的函数，以一定的概率生成表示完全不信任的负无穷值，并将对角线元素设置为0。
+        创建信任图。初始化时除对角线外的元素在指定范围内随机生成。
+        之后以一定概率将部分值设置为负无穷，表示完全不信任，并且设置某些元素为0，表示不认识（避免掩码冲突）。
         :param value_range: 信任值的范围，为(min_value, max_value)
         :param distrust_probability: 完全不信任的概率
-        :return: 带有表示不信任关系的随机信任图，对角线元素为0
+        :param unknown_probability: 不认识的概率
+        :return: 信任图，包含不信任和不认识关系的随机值，对角线元素为0
         """
+        distrust_probability = self.common_params['distrust_probability']
+        unknown_probability = self.common_params['unknown_probability']
+        value_range = self.common_params['trust_range']
         shape = (self.client_num_in_total, self.client_num_in_total)
         min_value, max_value = value_range
-        # 生成随机信任值数组
-        trust_array = np.random.rand(*shape) * (max_value - min_value) + min_value
-        # 以一定概率设置某些信任值为负无穷，表示完全不信任
-        distrust_mask = np.random.rand(*shape) < distrust_probability
-        trust_array[distrust_mask] = -np.inf
+        # 初始化信任矩阵，除对角线外的元素在指定范围内随机生成
+        trust_array = np.random.uniform(min_value, max_value, size=shape)
         # 将对角线元素设置为0
         np.fill_diagonal(trust_array, 0)
+        # 生成不信任掩码，并应用，设置部分元素为负无穷
+        distrust_mask = np.random.rand(*shape) < distrust_probability
+        np.fill_diagonal(distrust_mask, False)  # 保持对角线上的元素为0
+        trust_array[distrust_mask] = -np.inf
+
         return trust_array
 
     def upgrade_union_uid(self, union, uid_old, uid_new, nid=None):  # 新旧联盟的交替(通常发生在某客户离开/加入某联盟，会产生新的联盟，此时需要修改其余成员的记录)
@@ -312,18 +323,22 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
 
         # 新增代码：在最终联盟确定后，清除只有一个客户的联盟
         for uid, union in unions.items():  # 使用list来避免在遍历时修改字典
+            ban_cid_list = []
             for cid in union:  # 清除社会信任不足阈值的成员
                 if self.cal_trust_sum(union, cid) < self.common_params['trust_threshold']:
                     self.his_client_unions[cid].pop(uid)
-                    self.client_banned_list[cid] = 2  # 因为社会信任不足被剔除
-                    union.remove(cid)
+                    self.client_banned_list[cid] = 1  # 因为社会信任不足被剔除
+                    ban_cid_list.append(cid)
+            for cid in ban_cid_list:
+                union.remove(cid)
+
         # 清除自私集群的联盟
         ban_union_key_list = []
         for uid, union in unions.items():
-            if len(union) == 1:
-                cid = union[0]
-                self.his_client_unions[cid].pop(uid)
-                self.client_banned_list[cid] = 2  # 因为社会信任不足被剔除
+            if len(union) <= self.common_params['member_tolerance']:
+                for cid in union:
+                    self.his_client_unions[cid].pop(uid)
+                    self.client_banned_list[cid] = 2
                 ban_union_key_list.append(uid)
         print(ban_union_key_list)
         unions.ban_union(ban_union_key_list)
@@ -595,6 +610,7 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         self.cm_election(unions)  # 联盟主选举，并得到完整的联盟划分
         print(self.client_unions)
         mlops.event("联盟主选举", event_started=False)
+        print(len(self.client_banned_list))
         # 主从博弈
         for u_cid, union in self.client_unions.items():  # 先把两阶段的东西全部弄完，主要是淘汰掉失信客户
             mlops.event("主从博弈求解", event_started=True, event_value="盟主：{}".format(str(u_cid)))
@@ -646,10 +662,6 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
 
             mlops.log_round_info(self.args.comm_round, round_idx)
 
-            round_ws.append([round_idx,
-                             train_loss,
-                             train_acc,
-                             time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())])
 
             # 保存Excel文件到self.args.excel_save_path+文件名
             wb.save(
