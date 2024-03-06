@@ -110,13 +110,14 @@ class FedAvgAPI(object):
         # 参数1
         self.client_num_in_total = 50
         self.client_list = []
-        self.train_data_local_num_dict = self.get_local_sample_num(train_data_local_dict)
+        self.train_data_local_num_dict = train_data_local_num_dict
         self.train_data_local_dict = train_data_local_dict
         self.test_data_local_dict = test_data_local_dict
 
         # 历史联盟(客户历史所参与的,还没有盟主，字典存放联盟的id-客户对其偏好值)
-        self.trust_threshold = 70
+        self.trust_threshold = 80
         self.member_tolerance = 3
+        self.trust_matrix = self.create_trust_graph()
         self.his_client_unions = {i: {} for i in range(self.client_num_in_total)}
         logging.info("model = {}".format(model))
         self.model_trainer = create_model_trainer(model, args)
@@ -126,15 +127,6 @@ class FedAvgAPI(object):
         self._setup_clients(
             train_data_local_dict, test_data_local_dict, self.model_trainer,
         )
-
-    # 返回的样本量信息未对齐，暂时直接查询
-    def get_local_sample_num(self, train_data_local_dict):  # 现在传入的只会是dataloader对象
-        train_data_local_num_dict = {}
-        for cid in range(self.client_num_in_total):
-            train_data = train_data_local_dict[cid]
-            sample_num = len(train_data.dataset)
-            train_data_local_num_dict[cid] = sample_num
-        return train_data_local_num_dict
 
 
     def _setup_clients(
@@ -280,7 +272,6 @@ class FedAvgAPI(object):
         mlops.log_round_info(self.args.comm_round, -1)
         # 这部分同GBTC，用于确定那些是自私客户
         mlops.event("信任图生成", event_started=True)
-        self.trust_matrix = self.create_trust_graph()  # 客户交互图生成
         print(self.trust_matrix)
         mlops.event("信任图生成", event_started=False)
         mlops.event("联盟生成", event_started=True)

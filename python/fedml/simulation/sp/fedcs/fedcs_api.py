@@ -12,14 +12,13 @@ from fedml.ml.trainer.trainer_creator import create_model_trainer
 from .client import Client, client_upload_time, client_aggregation_time
 import matplotlib.pyplot as plt
 
-global_client_num_in_total = 60
-global_client_num_per_round = 30
-
 accuracy_list = []
 loss_list = []
+train_time = []
+
 # 参数0
 # 统计global_client_num_in_total个客户每个人的被选择次数
-client_selected_times = [0 for i in range(global_client_num_in_total)]
+# client_selected_times = [0 for i in range(global_client_num_in_total)]
 plt.figure(1, figsize=(20, 10))
 
 # 创建一个新的Excel工作簿
@@ -34,6 +33,56 @@ round_ws = wb.create_sheet('Round Info')
 round_ws.append(['Round', 'Loss', 'Accuracy', 'Time', 'Selected Client Indexs', 'Total Selected Client Times'])
 # 设置时间间隔（以秒为单位）
 interval = 5
+
+
+class AutoIncrementDict:
+    def __init__(self):
+        self._data = {}
+        self._next_id = 0
+
+    def add(self, value):
+        self._data[self._next_id] = value
+        current_id = self._next_id
+        self._next_id += 1
+        return current_id
+
+    def remove(self, key):
+        if key in self._data:
+            del self._data[key]
+
+    def get(self, key):
+        return self._data.get(key, None)
+
+    def __getitem__(self, key):
+        return self.get(key)
+
+    def __delitem__(self, key):
+        self.remove(key)
+
+    def __repr__(self):
+        return repr(self._data)
+
+    def items(self):
+        return self._data.items()
+
+    def keys(self):
+        return self._data.keys()
+
+    def values(self):
+        return self._data.values()
+
+    def remove_empty_values(self):
+        keys_to_remove = [key for key, value in self._data.items() if not value]
+        for key in keys_to_remove:
+            del self._data[key]
+
+    def ban_union(self, keys_to_remove):
+        for key in keys_to_remove:
+            del self._data[key]
+
+
+
+
 
 class FedCSAPI(object):
     def __init__(self, args, device, dataset, model):
@@ -50,18 +99,22 @@ class FedCSAPI(object):
             test_data_local_dict,
             class_num,
         ] = dataset
-
+        self.client_num_in_total = 50
         self.train_global = train_data_global
         self.test_global = test_data_global
         self.val_global = None
         self.train_data_num_in_total = train_data_num
         self.test_data_num_in_total = test_data_num
-        self.args.client_num_in_total = global_client_num_in_total # added
-        self.args.client_num_per_round = global_client_num_per_round # added
         self.client_list = []
         self.train_data_local_num_dict = train_data_local_num_dict
         self.train_data_local_dict = train_data_local_dict
         self.test_data_local_dict = test_data_local_dict
+
+        # 历史联盟(客户历史所参与的,还没有盟主，字典存放联盟的id-客户对其偏好值)
+        self.trust_threshold = 80
+        self.member_tolerance = 3
+        self.trust_matrix = self.create_trust_graph()
+        self.his_client_unions = {i: {} for i in range(self.client_num_in_total)}
 
         logging.info("model = {}".format(model))
         self.model_trainer = create_model_trainer(model, args)
@@ -88,6 +141,122 @@ class FedCSAPI(object):
             )
             self.client_list.append(c)
         logging.info("############setup_clients (END)#############")
+    def create_trust_graph(self, value_range=(1, 10), distrust_probability=0.01):
+        """
+        修改后的函数，以一定的概率生成表示完全不信任的负无穷值，并将对角线元素设置为0。
+        :param value_range: 信任值的范围，为(min_value, max_value)
+        :param distrust_probability: 完全不信任的概率
+        :return: 带有表示不信任关系的随机信任图，对角线元素为0
+        """
+        shape = (self.client_num_in_total, self.client_num_in_total)
+        min_value, max_value = value_range
+        # 生成随机信任值数组
+        trust_array = np.random.rand(*shape) * (max_value - min_value) + min_value
+        # 以一定概率设置某些信任值为负无穷，表示完全不信任
+        distrust_mask = np.random.rand(*shape) < distrust_probability
+        trust_array[distrust_mask] = -np.inf
+        # 将对角线元素设置为0
+        np.fill_diagonal(trust_array, 0)
+        return trust_array
+
+    def cal_preference(self, i, union):  # 客户对联盟的偏好函数,暂时不考虑历史联盟 (计算时不考虑历史参与)
+        pre = 0.0
+        for j in union:
+            if self.trust_matrix[i][j] == -np.inf:
+                pre = -np.inf
+                break
+            # elif
+            else:
+                pre += self.trust_matrix[i][j]
+        return pre
+
+    def upgrade_union_uid(self, union, uid_old, uid_new, nid=None):  # 新旧联盟的交替(通常发生在某客户离开/加入某联盟，会产生新的联盟，此时需要修改其余成员的记录)
+        for cid in union:  # 这里可选则将新增客户id传入,避免删除旧联盟id记录的操作
+            if cid != nid:
+                self.his_client_unions[cid].pop(uid_old)
+            self.his_client_unions[cid][uid_new] = self.cal_preference(cid, union)
+
+    def cal_trust_sum(self, union, cid):
+        return np.sum([self.trust_matrix[i][cid] for i in union])
+
+    def unions_formation(self):
+        """
+        生成初始联盟划分，同时避免联盟中存在信任值为负无穷的客户关系。
+        """
+        customer_ids = np.arange(self.client_num_in_total)
+        np.random.shuffle(customer_ids)
+        unions = AutoIncrementDict()
+        client_selfish_list = []
+        # 初始化联盟字典（自动计数id）
+        for customer_id in customer_ids:
+            added = False
+            for uid, members in unions.items():
+                can_add = True
+                for member in members:
+                    if (self.trust_matrix[customer_id, member] == -np.inf or
+                            self.trust_matrix[member, customer_id] == -np.inf):
+                        can_add = False
+                        break
+                if can_add:
+                    unions[uid].append(customer_id)
+                    self.his_client_unions[customer_id][uid] = None  # 此时联盟还未稳定，先不计算偏好值
+                    added = True
+                    break
+            if not added:
+                new_uid = unions.add([customer_id])
+                self.his_client_unions[customer_id][new_uid] = None  # 此时联盟还未稳定，先不计算偏好值
+        unions.remove_empty_values()  # 清除空联盟
+
+        stable = False
+        while not stable:
+            stable = True  # 假设本轮次不再发生联盟变化
+            for cid in range(self.client_num_in_total):  # 遍历每一位客户,初始将目前定义为最优
+                uid_i = next(reversed(self.his_client_unions[cid].keys()))  # 找到当前客户i所在的联盟id
+                best_pre_i = self.cal_preference(cid, unions[uid_i])  # 先计算客户对当前联盟的偏好值
+                best_uid_i = uid_i
+                for uid, union in unions.items():
+                    if uid == best_uid_i:  # 避免重新评估当前联盟
+                        continue
+                    else:
+                        pre = self.cal_preference(cid, union) \
+                            if uid not in self.his_client_unions[cid] else 0  # 计算客户对该新联盟的偏好值（此时需要考虑历史联盟的问题）
+                        if pre > best_pre_i:
+                            best_pre_i = pre
+                            best_uid_i = uid
+                            stable = False  # 如果发生了联盟变化，则本轮次不再稳定
+
+                if best_uid_i != uid_i:  # 如果找到了更好的联盟,双更新,也要更新原来两个联盟中客户绑定的uid
+                    # 更新旧联盟
+                    union_former = unions[uid_i]
+                    union_former.remove(cid)
+                    unions.remove(uid_i)
+                    new_uid_former = unions.add(union_former)
+                    self.upgrade_union_uid(union_former, uid_i, new_uid_former)
+                    # 更新新联盟
+                    union_latter = unions[best_uid_i]
+                    unions.remove(best_uid_i)
+                    union_latter.append(cid)
+                    new_uid_latter = unions.add(union_latter)
+                    self.his_client_unions[cid].pop(uid_i)
+                    self.upgrade_union_uid(union_latter, best_uid_i, new_uid_latter, cid)
+                unions.remove_empty_values()  # 清除空联盟
+
+        # 新增代码：在最终联盟确定后，清除只有一个客户的联盟
+        for uid, union in unions.items():  # 使用list来避免在遍历时修改字典
+            for cid in union:  # 清除社会信任不足阈值的成员
+                if self.cal_trust_sum(union, cid) < self.trust_threshold:
+                    self.his_client_unions[cid].pop(uid)
+                    client_selfish_list.append(cid)  # 因为社会信任不足被剔除
+                    union.remove(cid)
+
+        # 清除自私集群的联盟
+        for uid, union in unions.items():
+            if len(union) <= self.member_tolerance:
+                for cid in union:
+                    self.his_client_unions[cid].pop(uid)
+                    client_selfish_list.append(cid)
+
+        return client_selfish_list
 
     def train(self):
         logging.info("self.model_trainer = {}".format(self.model_trainer))
@@ -95,48 +264,45 @@ class FedCSAPI(object):
         mlops.log_training_status(mlops.ClientConstants.MSG_MLOPS_CLIENT_STATUS_TRAINING)
         mlops.log_aggregation_status(mlops.ServerConstants.MSG_MLOPS_SERVER_STATUS_RUNNING)
         mlops.log_round_info(self.args.comm_round, -1)
+        # 这部分同GBTC，用于确定那些是自私客户
+        mlops.event("信任图生成", event_started=True)
+        print(self.trust_matrix)
+        mlops.event("信任图生成", event_started=False)
+        mlops.event("联盟生成", event_started=True)
+        client_selfish_list = self.unions_formation()  # 初始联盟划分
+        mlops.event("联盟生成", event_started=False)
+        logging.info("client_banned_indexes = " + str(client_selfish_list))
+
         for round_idx in range(self.args.comm_round):
-
             logging.info("################Communication round : {}".format(round_idx))
-
-            w_locals = []
-
-            """
-            for scalability: following the original FedAvg algorithm, we uniformly sample a fraction of clients in each round.
-            Instead of changing the 'Client' instances, our implementation keeps the 'Client' instances and then updates their local dataset 
-            """
             client_indexes = self._client_sampling(
-                round_idx, self.args.client_num_in_total, self.args.client_num_per_round
-            )
+                round_idx, self.args.client_num_in_total, self.args.client_num_per_round)
+
             logging.info("client_indexes = " + str(client_indexes))
-
-            for idx, client in enumerate(self.client_list):
-                # update dataset
-                # 判断如果idx是client_indexes中的某一client的下标，那么就更新这个client的数据集
-                if client.client_idx in client_indexes:
-                    client_idx = client.client_idx
-                    client.update_local_dataset(
-                        client_idx,
-                        self.train_data_local_dict[client_idx],
-                        self.test_data_local_dict[client_idx],
-                        self.train_data_local_num_dict[client_idx],
-                    )
-
-                    # train on new dataset
-                    mlops.event("train", event_started=True, event_value="{}_{}".format(str(round_idx), str(client.client_idx)))
+            w_locals = []
+            s_time = time.time()
+            this_ban_cid = []
+            for cid in client_indexes:
+                client = self.client_list[cid]
+                # 自私客户不训练
+                if cid not in client_selfish_list:
+                    type = '诚实'
+                    mlops.event("train", event_started=True, event_value="轮次{}_客户id{}_类型{}".format(str(round_idx), str(cid), type))
                     w = client.train(copy.deepcopy(w_global))
-                    mlops.event("train", event_started=False, event_value="{}_{}".format(str(round_idx), str(client.client_idx)))
-                    # self.logging.info("local weights = " + str(w))
+                    mlops.event("train", event_started=False, event_value="轮次{}_客户id{}_类型{}".format(str(round_idx), str(cid), type))
                     w_locals.append((client.get_sample_number(), copy.deepcopy(w)))
-
-            # 借助client_selected_times统计global_client_num_in_total个客户每个人的被选择次数
-            for i in client_indexes:
-                client_selected_times[i] += 1
-
-            # update global weights
+                else:
+                    type = '自私'
+                    mlops.event("train", event_started=True, event_value="轮次{}_客户id{}_类型{}".format(str(round_idx), str(client.client_idx), type))
+                    w = copy.deepcopy(w_global)
+                    mlops.event("train", event_started=False, event_value="轮次{}_客户id{}_类型{}".format(str(round_idx), str(client.client_idx), type))
+                    w_locals.append((client.get_sample_number(), w))
+                    this_ban_cid.append(cid)
+            e_time = time.time()
+            train_time.append(e_time - s_time)  # 记录本轮的训练时间
+            print(this_ban_cid)
             mlops.event("agg", event_started=True, event_value=str(round_idx))
             w_global = self._aggregate(w_locals)
-
             self.model_trainer.set_model_params(w_global)
             mlops.event("agg", event_started=False, event_value=str(round_idx))
 
@@ -154,12 +320,12 @@ class FedCSAPI(object):
 
             mlops.log_round_info(self.args.comm_round, round_idx)
 
-            round_ws.append([round_idx,
-                                train_loss,
-                                train_acc,
-                                time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
-                                str(client_indexes),
-                                str(client_selected_times)])
+            # round_ws.append([round_idx,
+            #                     train_loss,
+            #                     train_acc,
+            #                     time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
+            #                     str(client_indexes),
+            #                     str(client_selected_times)])
 
             # 保存Excel文件到self.args.excel_save_path+文件名
             wb.save(self.args.excel_save_path + self.args.model + "_[" + self.args.dataset +"]_fedcs_training_results_NIID"+ str(self.args.experiment_niid_level) +".xlsx")
@@ -168,16 +334,6 @@ class FedCSAPI(object):
 
         mlops.log_training_finished_status()
         mlops.log_aggregation_finished_status()
-
-    # def _client_sampling(self, round_idx, client_num_in_total, client_num_per_round):
-    #     if client_num_in_total == client_num_per_round:
-    #         client_indexes = [client_index for client_index in range(client_num_in_total)]
-    #     else:
-    #         num_clients = min(client_num_per_round, client_num_in_total)
-    #         np.random.seed(round_idx)  # make sure for each comparison, we are selecting the same clients each round
-    #         client_indexes = np.random.choice(range(client_num_in_total), num_clients, replace=False)
-    #     logging.info("client_indexes = %s" % str(client_indexes))
-    #     return client_indexes
 
     def _client_sampling(self, round_idx, client_num_in_total, client_num_per_round):
         # Calculate the estimated time elapsed for each client
@@ -397,30 +553,30 @@ def plot_accuracy_and_loss(self, round_idx):
     plt.ylabel("value of loss")
     plt.plot(range(1, len(loss_list)+1), loss_list, 'b-', linewidth=2)
 
-    # 第3个子图，使用条形图展示每个客户的被选择次数
-    plt.subplot(2, 3, 3)
-    plt.title("num of selected")
-    plt.xlabel("num of epoch")
-    plt.ylabel("value of num of selected")
-    plt.bar(range(1, len(client_selected_times)+1), client_selected_times, width=0.5, fc='b')
+    # # 第3个子图，使用条形图展示每个客户的被选择次数
+    # plt.subplot(2, 3, 3)
+    # plt.title("num of selected")
+    # plt.xlabel("num of epoch")
+    # plt.ylabel("value of num of selected")
+    # plt.bar(range(1, len(client_selected_times)+1), client_selected_times, width=0.5, fc='b')
 
-    # 第4个子图，使用折线图展示每个客户的预估上传时间
-    plt.subplot(2, 3, 4)
-    plt.title("estimated upload time")
-    plt.xlabel("Clients' Indexes")
-    plt.ylabel("value of estimated upload time")
-    for i in range(len(client_upload_time)):
-        plt.plot(range(1, global_client_num_in_total+1), client_upload_time[i], label="Round {}".format(i + 1))
-    plt.legend()
+    # # 第4个子图，使用折线图展示每个客户的预估上传时间
+    # plt.subplot(2, 3, 4)
+    # plt.title("estimated upload time")
+    # plt.xlabel("Clients' Indexes")
+    # plt.ylabel("value of estimated upload time")
+    # for i in range(len(client_upload_time)):
+    #     plt.plot(range(1, global_client_num_in_total+1), client_upload_time[i], label="Round {}".format(i + 1))
+    # plt.legend()
 
-    # 第5个子图，使用折线图展示每个客户的预估聚合时间
-    plt.subplot(2, 3, 5)
-    plt.title("estimated aggregation time")
-    plt.xlabel("Clients' Indexes")
-    plt.ylabel("value of estimated aggregation time")
-    for i in range(len(client_aggregation_time)):
-        plt.plot(range(1, global_client_num_in_total+1), client_aggregation_time[i], label="Round {}".format(i + 1))
-    plt.legend()
+    # # 第5个子图，使用折线图展示每个客户的预估聚合时间
+    # plt.subplot(2, 3, 5)
+    # plt.title("estimated aggregation time")
+    # plt.xlabel("Clients' Indexes")
+    # plt.ylabel("value of estimated aggregation time")
+    # for i in range(len(client_aggregation_time)):
+    #     plt.plot(range(1, global_client_num_in_total+1), client_aggregation_time[i], label="Round {}".format(i + 1))
+    # plt.legend()
 
     plt.tight_layout()
     plt.pause(0.03)
