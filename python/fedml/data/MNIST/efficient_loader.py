@@ -4,7 +4,6 @@ import torch
 import torch.utils.data as data
 import torchvision.transforms as transforms
 from torchvision.datasets import MNIST
-
 from .without_reload import MNIST_truncated, MNIST_truncated_WO_reload
 
 

@@ -38,7 +38,7 @@ interval_params = {
     'lambda_cp': (1e-8, 1e-7),  # 客户单位计算开销范围
     'trust_range': (0, 10),  # 信任值范围
     'distrust_probability': 0.01,  # 完全不信任的概率
-    'trust_threshold': 70,  # 联盟信任阈值（低于阈值的剔除）
+    'trust_threshold': 35,  # 联盟信任阈值（低于阈值的剔除）
     'member_tolerance': 3,  # 联盟成员数量的容忍度（低于阈值的剔除）
     'pay_range': (10, 100),  # 盟主支付元素的范围
     'data_imp': (0.6, 0.9),  # 盟主对数据质量的重视程度
@@ -54,6 +54,9 @@ quality_ranges = {'cpu': (1, 5), 'ram': (1, 5), 'bm': (1, 5)}
 accuracy_list = []
 loss_list = []
 train_time_list = []
+union_num_list = []
+member_num_list = []
+selfish_num_list = []
 
 # 参数0
 # 统计global_client_num_in_total个客户每个人的被选择次数
@@ -61,19 +64,14 @@ plt.figure(1, figsize=(16, 4))
 
 # 创建一个新的Excel工作簿
 wb = openpyxl.Workbook()
-# 创建工作表
-client_ws = wb.create_sheet('Clients Info')
-# 写入损失指标的标头行
-client_ws.append(['Round', 'ClientIdx', 'Loss', 'Accuracy', 'Time'])
-# 创建工作表
-round_ws = wb.create_sheet('Round Info')
-# 写入精度指标的标头行
-round_ws.append(['Round', 'Loss', 'Accuracy', 'Time', 'Selected Client Indexs', 'Total Selected Client Times', 'K'])
-# 创建工作表
-bid_quality_ws = wb.create_sheet('Bid and Quality Info')
-# 写入精度指标的标头行
-bid_quality_ws.append(['Round', 'ClientIdx', 'Bid', 'Quality Score'])
-# 设置时间间隔（以秒为单位）
+# 删除默认创建的工作表（如果需要的话）
+if "Sheet" in wb.sheetnames:
+    wb.remove(wb["Sheet"])
+# 创建一个工作表用于存放全局指标
+global_metrics_ws = wb.create_sheet('Global Metrics')
+# 写入全局指标的标头行
+global_metrics_ws.append(['Round', 'Test Accuracy', 'Test Loss', 'Training Time', 'Union Num', 'Member Num', 'Selfish Num'])
+
 interval = 5
 
 
@@ -634,23 +632,39 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
             # at last round
             train_acc, train_loss, test_acc, test_loss = 0, 0, 0, 0
             if round_idx == self.args.comm_round - 1:
-                train_acc, train_loss, test_acc, test_loss = self._local_test_on_all_clients(round_idx)
+                self._local_test_on_all_clients(round_idx)
             # per {frequency_of_the_test} round
             elif round_idx % self.args.frequency_of_the_test == 0:
                 if self.args.dataset.startswith("stackoverflow"):
                     self._local_test_on_validation_set(round_idx)
                 else:
-                    train_acc, train_loss, test_acc, test_loss = self._local_test_on_all_clients(round_idx)
+                    self._local_test_on_all_clients(round_idx)
+            # 记录联盟实时数据
+            union_num_list.append(len(self.client_unions))
+            selfish_num = len(self.client_banned_list)
+            selfish_num_list.append(selfish_num)
+            member_num_list.append(self.client_num_in_total - selfish_num)
 
             mlops.log_round_info(self.args.comm_round, round_idx)
-
-
-            # 保存Excel文件到self.args.excel_save_path+文件名
-            wb.save(
-                self.args.excel_save_path + self.args.model + "_[" + self.args.dataset + "]_GBTC_training_results_NIID" + str(
-                    self.args.experiment_niid_level) + ".xlsx")
             # 休眠一段时间，以便下一个循环开始前有一些时间
-            time.sleep(interval)
+            # time.sleep(interval)
+
+        # 填充数据到工作表
+        for i in range(len(accuracy_list)):
+            # 轮次号，测试精度，测试损失，训练时间
+            round_num = i + 1  # 轮次号从1开始
+            accuracy = accuracy_list[i]
+            loss = loss_list[i]
+            train_time = train_time_list[i]
+            union_num = union_num_list[i]
+            member_num = member_num_list[i]
+            selfish_num = selfish_num_list[i]
+            global_metrics_ws.append([round_num, accuracy, loss, train_time, union_num, member_num, selfish_num])
+
+        # 保存Excel文件到self.args.excel_save_path+文件名
+        wb.save(
+            self.args.excel_save_path + self.args.model + "_[" + self.args.dataset + "]_GBTC_training_results_NIID" + str(
+                self.args.experiment_niid_level) + ".xlsx")
 
         mlops.log_training_finished_status()
         mlops.log_aggregation_finished_status()
@@ -663,18 +677,21 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         self.val_global = sample_testset
 
     def _aggregate(self, w_locals):
-        print("_aggregate.w_locals.length = " + str(len(w_locals)))
-        num_sum = sum([sample_num for sample_num, _ in w_locals])
+        training_num = 0
+        for idx in range(len(w_locals)):
+            (sample_num, averaged_params) = w_locals[idx]
+            training_num += sample_num
 
-        # 初始化一个空的有序字典来存储平均后的参数
-        averaged_params = collections.OrderedDict()
-
-        # 获取第一个本地模型的参数作为基础结构
-        _, first_model_params = w_locals[0]
-        for k in first_model_params.keys():
-            # 对于每个参数，计算加权平均值
-            averaged_params[k] = sum([w_locals[i][1][k] * w_locals[i][0] / num_sum for i in range(len(w_locals))])
-
+        (sample_num, averaged_params) = w_locals[0]
+        for k in averaged_params.keys():
+            print("______k = " + str(k))
+            for i in range(0, len(w_locals)):
+                local_sample_number, local_model_params = w_locals[i]
+                w = local_sample_number / training_num
+                if i == 0:
+                    averaged_params[k] = local_model_params[k] * w
+                else:
+                    averaged_params[k] += local_model_params[k] * w
         return averaged_params
 
     def _aggregate_resnet(self, w_locals, eweights):  # 弃用
@@ -751,11 +768,11 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
             test_metrics["num_correct"].append(copy.deepcopy(test_local_metrics["test_correct"]))
             test_metrics["losses"].append(copy.deepcopy(test_local_metrics["test_loss"]))
 
-            client_ws.append([round_idx,
-                              client_idx,
-                              train_metrics["losses"][client_idx] / train_metrics["num_samples"][client_idx],
-                              train_metrics["num_correct"][client_idx] / train_metrics["num_samples"][client_idx],
-                              time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())])
+            # client_ws.append([round_idx,
+            #                   client_idx,
+            #                   train_metrics["losses"][client_idx] / train_metrics["num_samples"][client_idx],
+            #                   train_metrics["num_correct"][client_idx] / train_metrics["num_samples"][client_idx],
+            #                   time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())])
 
         # test on training dataset
         train_acc = sum(train_metrics["num_correct"]) / sum(train_metrics["num_samples"])

@@ -190,7 +190,7 @@ def get_dataloader(dataset, datadir, train_bs, test_bs, dataidxs=None):
 def get_dataloader_test(
     dataset, datadir, train_bs, test_bs, dataidxs_train, dataidxs_test
 ):
-    return get_dataloader_test_CIFAR10(
+    return get_dataloader_test_MNIST(
         datadir, train_bs, test_bs, dataidxs_train, dataidxs_test
     )
 
@@ -215,7 +215,7 @@ def get_dataloader_MNIST(datadir, train_bs, test_bs, dataidxs=None):
     return train_dl, test_dl
 
 
-def get_dataloader_test_CIFAR10(
+def get_dataloader_test_MNIST(
     datadir, train_bs, test_bs, dataidxs_train=None, dataidxs_test=None
 ):
     dl_obj = MNIST_truncated

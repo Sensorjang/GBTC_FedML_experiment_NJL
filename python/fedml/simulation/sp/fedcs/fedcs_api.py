@@ -14,7 +14,9 @@ import matplotlib.pyplot as plt
 
 accuracy_list = []
 loss_list = []
-train_time = []
+train_time_list = []
+member_num_list = []
+selfish_num_list = []
 
 # 参数0
 # 统计global_client_num_in_total个客户每个人的被选择次数
@@ -23,14 +25,14 @@ plt.figure(1, figsize=(20, 10))
 
 # 创建一个新的Excel工作簿
 wb = openpyxl.Workbook()
-# 创建工作表
-client_ws = wb.create_sheet('Clients Info')
-# 写入损失指标的标头行
-client_ws.append(['Round', 'ClientIdx', 'Loss', 'Accuracy', 'Time'])
-# 创建工作表
-round_ws = wb.create_sheet('Round Info')
-# 写入精度指标的标头行
-round_ws.append(['Round', 'Loss', 'Accuracy', 'Time', 'Selected Client Indexs', 'Total Selected Client Times'])
+# 删除默认创建的工作表（如果需要的话）
+if "Sheet" in wb.sheetnames:
+    wb.remove(wb["Sheet"])
+# 创建一个工作表用于存放全局指标
+global_metrics_ws = wb.create_sheet('Global Metrics')
+# 写入全局指标的标头行
+global_metrics_ws.append(['Round', 'Test Accuracy', 'Test Loss', 'Training Time', 'Member Num', 'Selfish Num'])
+
 # 设置时间间隔（以秒为单位）
 interval = 5
 
@@ -276,9 +278,10 @@ class FedCSAPI(object):
         for round_idx in range(self.args.comm_round):
             logging.info("################Communication round : {}".format(round_idx))
             client_indexes = self._client_sampling(
-                round_idx, self.args.client_num_in_total, self.args.client_num_per_round)
+                round_idx, self.args.client_num_in_total)
 
             logging.info("client_indexes = " + str(client_indexes))
+            print(len(client_indexes))
             w_locals = []
             s_time = time.time()
             this_ban_cid = []
@@ -294,13 +297,13 @@ class FedCSAPI(object):
                 else:
                     type = '自私'
                     mlops.event("train", event_started=True, event_value="轮次{}_客户id{}_类型{}".format(str(round_idx), str(client.client_idx), type))
-                    w = copy.deepcopy(w_global)
                     mlops.event("train", event_started=False, event_value="轮次{}_客户id{}_类型{}".format(str(round_idx), str(client.client_idx), type))
-                    w_locals.append((client.get_sample_number(), w))
+                    w_locals.append((client.get_sample_number(), copy.deepcopy(w_global)))
                     this_ban_cid.append(cid)
             e_time = time.time()
-            train_time.append(e_time - s_time)  # 记录本轮的训练时间
+            train_time_list.append(e_time - s_time)  # 记录本轮的训练时间
             print(this_ban_cid)
+            print(len(this_ban_cid))
             mlops.event("agg", event_started=True, event_value=str(round_idx))
             w_global = self._aggregate(w_locals)
             self.model_trainer.set_model_params(w_global)
@@ -319,7 +322,9 @@ class FedCSAPI(object):
                     train_acc, train_loss, test_acc, test_loss = self._local_test_on_all_clients(round_idx)
 
             mlops.log_round_info(self.args.comm_round, round_idx)
-
+            selfish_num = len(client_selfish_list)
+            selfish_num_list.append(selfish_num)
+            member_num_list.append(self.client_num_in_total - selfish_num)
             # round_ws.append([round_idx,
             #                     train_loss,
             #                     train_acc,
@@ -327,15 +332,28 @@ class FedCSAPI(object):
             #                     str(client_indexes),
             #                     str(client_selected_times)])
 
+            # 填充数据到工作表
+            for i in range(len(accuracy_list)):
+                # 轮次号，测试精度，测试损失，训练时间
+                round_num = i + 1  # 轮次号从1开始
+                accuracy = accuracy_list[i]
+                loss = loss_list[i]
+                train_time = train_time_list[i]
+                member_num = member_num_list[i]
+                selfish_num = selfish_num_list[i]
+                global_metrics_ws.append([round_num, accuracy, loss, train_time, member_num, selfish_num])
+
             # 保存Excel文件到self.args.excel_save_path+文件名
-            wb.save(self.args.excel_save_path + self.args.model + "_[" + self.args.dataset +"]_fedcs_training_results_NIID"+ str(self.args.experiment_niid_level) +".xlsx")
+            wb.save(
+                self.args.excel_save_path + self.args.model + "_[" + self.args.dataset + "]_FedCS_training_results_NIID" + str(
+                    self.args.experiment_niid_level) + ".xlsx")
             # 休眠一段时间，以便下一个循环开始前有一些时间
-            time.sleep(interval)
+            # time.sleep(interval)
 
         mlops.log_training_finished_status()
         mlops.log_aggregation_finished_status()
 
-    def _client_sampling(self, round_idx, client_num_in_total, client_num_per_round):
+    def _client_sampling(self, round_idx, client_num_in_total):
         # Calculate the estimated time elapsed for each client
         Tcs = 1  # Client Selection step time
         Td = 0  # Total time for clients in S
@@ -441,11 +459,11 @@ class FedCSAPI(object):
             test_metrics["num_correct"].append(copy.deepcopy(test_local_metrics["test_correct"]))
             test_metrics["losses"].append(copy.deepcopy(test_local_metrics["test_loss"]))
 
-            client_ws.append([round_idx,
-                              client_idx,
-                              train_metrics["losses"][client_idx] / train_metrics["num_samples"][client_idx],
-                              train_metrics["num_correct"][client_idx] / train_metrics["num_samples"][client_idx],
-                              time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())])
+            # client_ws.append([round_idx,
+            #                   client_idx,
+            #                   train_metrics["losses"][client_idx] / train_metrics["num_samples"][client_idx],
+            #                   train_metrics["num_correct"][client_idx] / train_metrics["num_samples"][client_idx],
+            #                   time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())])
 
         # test on training dataset
         train_acc = sum(train_metrics["num_correct"]) / sum(train_metrics["num_samples"])

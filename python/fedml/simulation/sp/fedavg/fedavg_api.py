@@ -17,7 +17,9 @@ import matplotlib.pyplot as plt
 # 记录每轮的信息
 accuracy_list = []
 loss_list = []
-train_time = []
+train_time_list = []
+member_num_list = []
+selfish_num_list = []
 
 # 参数0
 # 统计global_client_num_in_total个客户每个人的被选择次数
@@ -26,14 +28,13 @@ plt.figure(1, figsize=(10, 5))
 
 # 创建一个新的Excel工作簿
 wb = openpyxl.Workbook()
-# 创建工作表
-client_ws = wb.create_sheet('Clients Info')
-# 写入损失指标的标头行
-client_ws.append(['Round', 'ClientIdx', 'Loss', 'Accuracy', 'Time'])
-# 创建工作表
-round_ws = wb.create_sheet('Round Info')
-# 写入精度指标的标头行
-round_ws.append(['Round', 'Loss', 'Accuracy', 'Time', 'Selected Client Indexs', 'Total Selected Client Times'])
+# 删除默认创建的工作表（如果需要的话）
+if "Sheet" in wb.sheetnames:
+    wb.remove(wb["Sheet"])
+# 创建一个工作表用于存放全局指标
+global_metrics_ws = wb.create_sheet('Global Metrics')
+# 写入全局指标的标头行
+global_metrics_ws.append(['Round', 'Test Accuracy', 'Test Loss', 'Training Time', 'Member Num', 'Selfish Num'])
 # 设置时间间隔（以秒为单位）
 interval = 5
 
@@ -115,7 +116,7 @@ class FedAvgAPI(object):
         self.test_data_local_dict = test_data_local_dict
 
         # 历史联盟(客户历史所参与的,还没有盟主，字典存放联盟的id-客户对其偏好值)
-        self.trust_threshold = 80
+        self.trust_threshold = 50
         self.member_tolerance = 3
         self.trust_matrix = self.create_trust_graph()
         self.his_client_unions = {i: {} for i in range(self.client_num_in_total)}
@@ -299,7 +300,7 @@ class FedAvgAPI(object):
                     mlops.event("train", event_started=False, event_value="轮次{}_客户id{}_类型{}".format(str(round_idx), str(client.client_idx), type))
                     w_locals.append((client.get_sample_number(), w))
             e_time = time.time()
-            train_time.append(e_time - s_time)  # 记录本轮的训练时间
+            train_time_list.append(e_time - s_time)  # 记录本轮的训练时间
 
             mlops.event("agg", event_started=True, event_value=str(round_idx))
             w_global = self._aggregate(w_locals)
@@ -319,12 +320,29 @@ class FedAvgAPI(object):
                     train_acc, train_loss, test_acc, test_loss = self._local_test_on_all_clients(round_idx)
 
             mlops.log_round_info(self.args.comm_round, round_idx)
+            # 记录联盟实时数据
+            # union_num_list.append(len(self.client_unions))
+            selfish_num = len(client_selfish_list)
+            selfish_num_list.append(selfish_num)
+            member_num_list.append(self.client_num_in_total - selfish_num)
 
-            # 保存Excel文件到self.args.excel_save_path+文件名
-            wb.save(self.args.excel_save_path + self.args.model + "_[" + self.args.dataset +"]_fedavg_training_results_NIID"+ str(self.args.experiment_niid_level) +".xlsx")
-            # 休眠一段时间，以便下一个循环开始前有一些时间
-            time.sleep(interval)
+            # time.sleep(interval)
 
+        # 填充数据到工作表
+        for i in range(len(accuracy_list)):
+            # 轮次号，测试精度，测试损失，训练时间
+            round_num = i + 1  # 轮次号从1开始
+            accuracy = accuracy_list[i]
+            loss = loss_list[i]
+            train_time = train_time_list[i]
+            member_num = member_num_list[i]
+            selfish_num = selfish_num_list[i]
+            global_metrics_ws.append([round_num, accuracy, loss, train_time, member_num, selfish_num])
+
+        # 保存Excel文件到self.args.excel_save_path+文件名
+        wb.save(
+            self.args.excel_save_path + self.args.model + "_[" + self.args.dataset + "]_FedAvg_training_results_NIID" + str(
+                self.args.experiment_niid_level) + ".xlsx")
         mlops.log_training_finished_status()
         mlops.log_aggregation_finished_status()
 
@@ -460,11 +478,11 @@ class FedAvgAPI(object):
             test_metrics["num_correct"].append(copy.deepcopy(test_local_metrics["test_correct"]))
             test_metrics["losses"].append(copy.deepcopy(test_local_metrics["test_loss"]))
 
-            client_ws.append([round_idx,
-                              client_idx,
-                              train_metrics["losses"][client_idx] / train_metrics["num_samples"][client_idx],
-                              train_metrics["num_correct"][client_idx] / train_metrics["num_samples"][client_idx],
-                              time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())])
+            # client_ws.append([round_idx,
+            #                   client_idx,
+            #                   train_metrics["losses"][client_idx] / train_metrics["num_samples"][client_idx],
+            #                   train_metrics["num_correct"][client_idx] / train_metrics["num_samples"][client_idx],
+            #                   time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())])
 
         # test on training dataset
         train_acc = sum(train_metrics["num_correct"]) / sum(train_metrics["num_samples"])
