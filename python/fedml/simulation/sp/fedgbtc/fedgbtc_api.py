@@ -307,7 +307,7 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
                 union.remove(cid)
 
         # min_union = self.common_params['member_range'][0]
-        max_union = self.common_params['member_range'][1]
+        # max_union = self.common_params['member_range'][1]
 
         # 清除自私集群的联盟
         ban_union_key_list = []
@@ -766,28 +766,25 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
             averaged_params[k] = sum(temp_w) / len(temp_w)
         return averaged_params
 
+
+    def local_test_thread(self, cid):
+        return self.client_list[cid].local_test(True)
     def _local_test_on_all_clients(self, round_idx):
 
         logging.info("################local_test_on_all_clients : {}".format(round_idx))
 
         test_metrics = {"num_samples": [], "num_correct": [], "losses": []}
 
-        client = self.client_list[0]
-
-        for client_idx in range(self.args.client_num_in_total):
-
-            if self.test_data_local_dict[client_idx] is None:
-                continue
-            client.update_local_dataset(
-                self.train_data_local_dict[client_idx],
-                self.test_data_local_dict[client_idx],
-                self.train_data_local_num_dict[client_idx],
-            )
-            # test data
-            test_local_metrics = client.local_test(True)
-            test_metrics["num_samples"].append(copy.deepcopy(test_local_metrics["test_total"]))
-            test_metrics["num_correct"].append(copy.deepcopy(test_local_metrics["test_correct"]))
-            test_metrics["losses"].append(copy.deepcopy(test_local_metrics["test_loss"]))
+        with ThreadPoolExecutor(max_workers=self.client_num_in_total) as executor:  # 多线程全客户测试（修复之前错误的测试逻辑，仅在0客户上测试）
+            futures = []
+            for cid in range(self.client_num_in_total):
+                future = executor.submit(self.local_test_thread, cid)
+                futures.append(future)
+            for future in futures:
+                test_metrics_cid = future.result()
+                test_metrics["num_samples"].append(test_metrics_cid["test_total"])
+                test_metrics["num_correct"].append(test_metrics_cid["test_correct"])
+                test_metrics["losses"].append(test_metrics_cid["test_loss"])
 
         # test on test dataset
         test_acc = sum(test_metrics["num_correct"]) / sum(test_metrics["num_samples"])

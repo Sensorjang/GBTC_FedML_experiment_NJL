@@ -1,6 +1,7 @@
 import copy
 import logging
 import random
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -442,68 +443,28 @@ class FedCSAPI(object):
             averaged_params[k] = sum(temp_w) / len(temp_w)
         return averaged_params
 
+    def local_test_thread(self, cid):
+        return self.client_list[cid].local_test(True)
     def _local_test_on_all_clients(self, round_idx):
 
         logging.info("################local_test_on_all_clients : {}".format(round_idx))
 
-        train_metrics = {"num_samples": [], "num_correct": [], "losses": []}
-
         test_metrics = {"num_samples": [], "num_correct": [], "losses": []}
 
-        client = self.client_list[0]
-
-        for client_idx in range(self.args.client_num_in_total):
-            """
-            Note: for datasets like "fed_CIFAR100" and "fed_shakespheare",
-            the training client number is larger than the testing client number
-            """
-            if self.test_data_local_dict[client_idx] is None:
-                continue
-            client.update_local_dataset(
-                0,
-                self.train_data_local_dict[client_idx],
-                self.test_data_local_dict[client_idx],
-                self.train_data_local_num_dict[client_idx],
-            )
-            # train data
-            train_local_metrics = client.local_test(False)
-            train_metrics["num_samples"].append(copy.deepcopy(train_local_metrics["test_total"]))
-            train_metrics["num_correct"].append(copy.deepcopy(train_local_metrics["test_correct"]))
-            train_metrics["losses"].append(copy.deepcopy(train_local_metrics["test_loss"]))
-
-            # test data
-            test_local_metrics = client.local_test(True)
-            test_metrics["num_samples"].append(copy.deepcopy(test_local_metrics["test_total"]))
-            test_metrics["num_correct"].append(copy.deepcopy(test_local_metrics["test_correct"]))
-            test_metrics["losses"].append(copy.deepcopy(test_local_metrics["test_loss"]))
-
-            # client_ws.append([round_idx,
-            #                   client_idx,
-            #                   train_metrics["losses"][client_idx] / train_metrics["num_samples"][client_idx],
-            #                   train_metrics["num_correct"][client_idx] / train_metrics["num_samples"][client_idx],
-            #                   time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())])
-
-        # test on training dataset
-        train_acc = sum(train_metrics["num_correct"]) / sum(train_metrics["num_samples"])
-        train_loss = sum(train_metrics["losses"]) / sum(train_metrics["num_samples"])
+        with ThreadPoolExecutor(max_workers=self.client_num_in_total) as executor:  # 多线程全客户测试（修复之前错误的测试逻辑，仅在0客户上测试）
+            futures = []
+            for cid in range(self.client_num_in_total):
+                future = executor.submit(self.local_test_thread, cid)
+                futures.append(future)
+            for future in futures:
+                test_metrics_cid = future.result()
+                test_metrics["num_samples"].append(test_metrics_cid["test_total"])
+                test_metrics["num_correct"].append(test_metrics_cid["test_correct"])
+                test_metrics["losses"].append(test_metrics_cid["test_loss"])
 
         # test on test dataset
         test_acc = sum(test_metrics["num_correct"]) / sum(test_metrics["num_samples"])
         test_loss = sum(test_metrics["losses"]) / sum(test_metrics["num_samples"])
-
-        stats = {"training_acc": train_acc, "training_loss": train_loss}
-        if self.args.enable_wandb:
-            wandb.log({"Train/Acc": train_acc, "round": round_idx})
-            wandb.log({"Train/Loss": train_loss, "round": round_idx})
-
-        # 绘制精度图
-        accuracy_list.append(train_acc)
-        loss_list.append(train_loss)
-        plot_accuracy_and_loss(self, round_idx)
-
-        mlops.log({"Train/Acc": train_acc, "round": round_idx})
-        mlops.log({"Train/Loss": train_loss, "round": round_idx})
-        logging.info(stats)
 
         stats = {"test_acc": test_acc, "test_loss": test_loss}
         if self.args.enable_wandb:
@@ -513,8 +474,12 @@ class FedCSAPI(object):
         mlops.log({"Test/Acc": test_acc, "round": round_idx})
         mlops.log({"Test/Loss": test_loss, "round": round_idx})
         logging.info(stats)
+        # 绘制精度图(存入测试图)
+        accuracy_list.append(test_acc)
+        loss_list.append(test_loss)
+        plot_accuracy_and_loss(self, round_idx)
 
-        return train_acc, train_loss, test_acc, test_loss
+        return test_acc, test_loss
 
     def _local_test_on_validation_set(self, round_idx):
 
