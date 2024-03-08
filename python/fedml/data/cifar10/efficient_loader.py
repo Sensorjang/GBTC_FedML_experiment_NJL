@@ -375,35 +375,6 @@ def efficient_load_partition_data_cifar10(
         train_data_local_dict[client_idx] = train_data_local
         test_data_local_dict[client_idx] = test_data_local
 
-    # NIID可控逻辑
-
-    # 对客户端按数据点数降序排序
-    sorted_clients_idx = sorted(data_local_num_dict, key=data_local_num_dict.get, reverse=True)
-
-    # 计算x%的数据的索引
-    x_partition_idx = round(len(sorted_clients_idx) * args.experiment_niid_level)
-
-    # 将客户端分为两部分
-    x_sorted_clients = sorted_clients_idx[:x_partition_idx]
-    remaining_clients = sorted_clients_idx[x_partition_idx:]
-
-    # 打乱剩余客户端的顺序
-    np.random.shuffle(remaining_clients)
-
-    # 将两部分客户端合并
-    mixed_clients = np.concatenate((x_sorted_clients, remaining_clients), axis=0)
-
-    # 为每个客户端分配训练和测试数据
-    train_data_local_dict_mixed = dict()
-    test_data_local_dict_mixed = dict()
-
-    idx = 0
-    for client_idx in mixed_clients:
-        train_data_local_dict_mixed[idx] = train_data_local_dict[client_idx]
-        test_data_local_dict_mixed[idx] = test_data_local_dict[client_idx]
-        idx += 1
-
-    # NIID可控逻辑^^^^
 
     return (
         train_data_num,
@@ -411,7 +382,7 @@ def efficient_load_partition_data_cifar10(
         train_data_global,
         test_data_global,
         data_local_num_dict,
-        train_data_local_dict_mixed,
-        test_data_local_dict_mixed,
+        train_data_local_dict,
+        test_data_local_dict,
         class_num,
     )

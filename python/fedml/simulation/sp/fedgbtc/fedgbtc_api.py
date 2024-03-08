@@ -38,8 +38,8 @@ interval_params = {
     'lambda_cp': (1e-8, 1e-7),  # 客户单位计算开销范围
     'trust_range': (0, 10),  # 信任值范围
     'distrust_probability': 0.01,  # 完全不信任的概率
-    'trust_threshold': 35,  # 联盟信任阈值（低于阈值的剔除）
-    'member_tolerance': 3,  # 联盟成员数量的容忍度（低于阈值的剔除）
+    # 'trust_threshold': 50,  # 联盟信任阈值（低于阈值的剔除）弃用
+    # 'member_range': (),  # 联盟成员数量的容忍度（低于阈值的剔除）弃用
     'pay_range': (10, 100),  # 盟主支付元素的范围
     'data_imp': (0.6, 0.9),  # 盟主对数据质量的重视程度
     'data_share': (0.05, 0.1),  # 成员对盟主的数据共享率
@@ -70,7 +70,8 @@ if "Sheet" in wb.sheetnames:
 # 创建一个工作表用于存放全局指标
 global_metrics_ws = wb.create_sheet('Global Metrics')
 # 写入全局指标的标头行
-global_metrics_ws.append(['Round', 'Test Accuracy', 'Test Loss', 'Training Time', 'Union Num', 'Member Num', 'Selfish Num'])
+global_metrics_ws.append(
+    ['Round', 'Test Accuracy', 'Test Loss', 'Training Time', 'Union Num', 'Member Num', 'Selfish Num'])
 
 interval = 5
 
@@ -142,13 +143,13 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         self.train_data_num_in_total = train_data_num
         self.test_data_num_in_total = test_data_num
         self.class_num = class_num
-        self.client_num_in_total = 50 # 不要太多了，否则求解时间太长
+        self.client_num_in_total = 50  # 不要太多了，否则求解时间太长
         self.client_list = []  # 原始的客户集合（全部），不以联盟区分
-        self.train_data_local_num_dict = self.get_local_sample_num(train_data_local_dict)
+        self.train_data_local_num_dict = train_data_local_num_dict
         self.train_data_local_dict = train_data_local_dict
         self.test_data_local_dict = test_data_local_dict
         # 乐享联盟参数
-        self.common_params = {}
+        self.common_params = {'trust_threshold': args.trust_threshold, 'member_range': tuple(args.member_range)}
         self.quality_weights = quality_weights
         self.client_data_distribution = {i: {} for i in range(self.client_num_in_total)}  # 存储每个客户的数据概率分布
         self.client_params = {i: {} for i in range(self.client_num_in_total)}  # 存储每个客户的交互参数
@@ -173,14 +174,6 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         logging.info("self.model_trainer = {}".format(self.model_trainer))
 
         self._setup_clients(train_data_local_dict, test_data_local_dict)
-
-    def get_local_sample_num(self, train_data_local_dict):  # 现在传入的只会是dataloader对象
-        train_data_local_num_dict = {}
-        for cid in range(self.client_num_in_total):
-            train_data = train_data_local_dict[cid]
-            sample_num = len(train_data.dataset)
-            train_data_local_num_dict[cid] = sample_num
-        return train_data_local_num_dict
 
     def params_generator(self):  # 客户独立参数的赋值
         for key, value in interval_params.items():
@@ -305,24 +298,65 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         for uid, union in unions.items():  # 使用list来避免在遍历时修改字典
             ban_cid_list = []
             for cid in union:  # 清除社会信任不足阈值的成员
-                if self.cal_trust_sum(union, cid) < self.common_params['trust_threshold']:
+                ts = self.cal_trust_sum(union, cid)
+                if ts < self.common_params['trust_threshold']:
                     self.his_client_unions[cid].pop(uid)
-                    self.client_banned_list[cid] = 1  # 因为社会信任不足被剔除
+                    self.client_banned_list[cid] = ts  # 因为社会信任不足被剔除
                     ban_cid_list.append(cid)
             for cid in ban_cid_list:
                 union.remove(cid)
 
+        # min_union = self.common_params['member_range'][0]
+        max_union = self.common_params['member_range'][1]
+
         # 清除自私集群的联盟
         ban_union_key_list = []
         for uid, union in unions.items():
-            if len(union) <= self.common_params['member_tolerance']:
+            if len(union) <= 3:
                 for cid in union:
                     self.his_client_unions[cid].pop(uid)
-                    self.client_banned_list[cid] = 2
+                    self.client_banned_list[cid] = -1  # 因为自私成盟被剔除
                 ban_union_key_list.append(uid)
         print(ban_union_key_list)
         unions.ban_union(ban_union_key_list)
 
+        # # 联盟人数恢复策略
+        # self.client_banned_list = dict(sorted(self.client_banned_list.items(), key=lambda x: x[1], reverse=True)) # 按照历史社会声誉的逆序
+        # min_uid = list(sorted(unions.items(), key=lambda x: len(x[1]), reverse=False))[0][0]  # 按照字典的值-联盟长度逆序排序
+        # len_rest = len(self.client_banned_list)
+        # while len_rest > min_union:
+        #     if len_rest - min_union >= min_union:
+        #         new_union = []
+        #         for i in range(min_union):
+        #             new_union.append(self.client_banned_list.popitem()[0])
+        #         unions.add(new_union)  # 取出前5加入
+        #         len_rest -= min_union
+        #     else:
+        #         cid, _ = self.client_banned_list.popitem()
+        #         unions[min_uid].append(cid)
+        #         min_uid = list(sorted(unions.items(), key=lambda x: len(x[1]), reverse=False))[0][0]
+        #         len_rest -= 1
+        # 联盟人数限制策略
+        # over_union = []  # 记录超出客户的id
+        # for uid, union in unions.items():
+        #     union_len = len(union)
+        #     if union_len > max_union:
+        #         for i in range(union_len - max_union):
+        #             over_union.append(union.pop())
+        #     elif union_len < max_union:  # 说明可以存入
+        #         add_num = min(len(over_union), (max_union - union_len))
+        #         union.extend(over_union[:add_num])
+        #         over_union = over_union[add_num:]
+        # over_num = len(over_union)
+        # if over_num >= min_union:
+        #     unions.add(over_union)
+        # else:
+        #     while over_num > 0:
+        #         for uid, union in unions.items():
+        #             union.append(over_union.pop())
+        #             over_num -= 1
+        #             if over_num == 0:
+        #                 break
         # 返回稳定的联盟
         return unions
 
@@ -535,7 +569,7 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         #         self.client_rewards[cid] = (pay_vector[i], band_vector[i])
         #     else:
         #         self.client_rewards[cid] = (0, 0)  # 联盟内部均衡解不淘汰
-                # self.client_banned_List[cid] = 3  # 因为均衡解为0被剔除(弃用)
+        # self.client_banned_List[cid] = 3  # 因为均衡解为0被剔除(弃用)
 
     def _setup_clients(self, train_data_local_dict, test_data_local_dict):
         logging.info("############setup_clients (START)#############")
@@ -555,7 +589,6 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         self.params_generator()
         logging.info("############setup_clients (END)#############")
 
-
     def train_union(self, u_cid, w_global):
         union = self.client_unions[u_cid]
         num_union = 0  # 记录联盟内的总样本量
@@ -569,7 +602,6 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
             num_union += num_i
             w_locals.append((num_i, copy.deepcopy(w)))
         return num_union, w_locals
-
 
     def train(self):
         logging.info("self.model_trainer = {}".format(self.model_trainer))
@@ -738,17 +770,12 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
 
         logging.info("################local_test_on_all_clients : {}".format(round_idx))
 
-        train_metrics = {"num_samples": [], "num_correct": [], "losses": []}
-
         test_metrics = {"num_samples": [], "num_correct": [], "losses": []}
 
         client = self.client_list[0]
 
         for client_idx in range(self.args.client_num_in_total):
-            """
-            Note: for datasets like "fed_CIFAR100" and "fed_shakespheare",
-            the training client number is larger than the testing client number
-            """
+
             if self.test_data_local_dict[client_idx] is None:
                 continue
             client.update_local_dataset(
@@ -756,46 +783,15 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
                 self.test_data_local_dict[client_idx],
                 self.train_data_local_num_dict[client_idx],
             )
-            # train data
-            train_local_metrics = client.local_test(False)
-            train_metrics["num_samples"].append(copy.deepcopy(train_local_metrics["test_total"]))
-            train_metrics["num_correct"].append(copy.deepcopy(train_local_metrics["test_correct"]))
-            train_metrics["losses"].append(copy.deepcopy(train_local_metrics["test_loss"]))
-
             # test data
             test_local_metrics = client.local_test(True)
             test_metrics["num_samples"].append(copy.deepcopy(test_local_metrics["test_total"]))
             test_metrics["num_correct"].append(copy.deepcopy(test_local_metrics["test_correct"]))
             test_metrics["losses"].append(copy.deepcopy(test_local_metrics["test_loss"]))
 
-            # client_ws.append([round_idx,
-            #                   client_idx,
-            #                   train_metrics["losses"][client_idx] / train_metrics["num_samples"][client_idx],
-            #                   train_metrics["num_correct"][client_idx] / train_metrics["num_samples"][client_idx],
-            #                   time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())])
-
-        # test on training dataset
-        train_acc = sum(train_metrics["num_correct"]) / sum(train_metrics["num_samples"])
-        train_loss = sum(train_metrics["losses"]) / sum(train_metrics["num_samples"])
-
         # test on test dataset
         test_acc = sum(test_metrics["num_correct"]) / sum(test_metrics["num_samples"])
         test_loss = sum(test_metrics["losses"]) / sum(test_metrics["num_samples"])
-
-        stats = {"training_acc": train_acc, "training_loss": train_loss}
-
-        # 绘制精度图
-        accuracy_list.append(train_acc)
-        loss_list.append(train_loss)
-        plot_accuracy_and_loss(self, round_idx)
-
-        if self.args.enable_wandb:
-            wandb.log({"Train/Acc": train_acc, "round": round_idx})
-            wandb.log({"Train/Loss": train_loss, "round": round_idx})
-
-        mlops.log({"Train/Acc": train_acc, "round": round_idx})
-        mlops.log({"Train/Loss": train_loss, "round": round_idx})
-        logging.info(stats)
 
         stats = {"test_acc": test_acc, "test_loss": test_loss}
         if self.args.enable_wandb:
@@ -805,8 +801,12 @@ class FedGBTCAPI(object):  # 变量参考FARA代码
         mlops.log({"Test/Acc": test_acc, "round": round_idx})
         mlops.log({"Test/Loss": test_loss, "round": round_idx})
         logging.info(stats)
+        # 绘制精度图(存入测试图)
+        accuracy_list.append(test_acc)
+        loss_list.append(test_loss)
+        plot_accuracy_and_loss(self, round_idx)
 
-        return train_acc, train_loss, test_acc, test_loss
+        return test_acc, test_loss
 
     def _local_test_on_validation_set(self, round_idx):
 

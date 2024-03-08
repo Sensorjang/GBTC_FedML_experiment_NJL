@@ -412,7 +412,7 @@ def efficient_load_partition_data_fashionMNIST(
         train_data_global,
         test_data_global,
         data_local_num_dict,
-        train_data_local_dict_mixed,
-        test_data_local_dict_mixed,
+        train_data_local_dict,
+        test_data_local_dict,
         class_num,
     )

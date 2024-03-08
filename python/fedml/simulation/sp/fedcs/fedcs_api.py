@@ -113,8 +113,8 @@ class FedCSAPI(object):
         self.test_data_local_dict = test_data_local_dict
 
         # 历史联盟(客户历史所参与的,还没有盟主，字典存放联盟的id-客户对其偏好值)
-        self.trust_threshold = 80
-        self.member_tolerance = 3
+        self.trust_threshold = args.trust_threshold
+        self.member_range = tuple(args.member_range)
         self.trust_matrix = self.create_trust_graph()
         self.his_client_unions = {i: {} for i in range(self.client_num_in_total)}
 
@@ -251,12 +251,30 @@ class FedCSAPI(object):
                     client_selfish_list.append(cid)  # 因为社会信任不足被剔除
                     union.remove(cid)
 
+        min_union = self.member_range[0]  # 不成盟，只用处理下界
         # 清除自私集群的联盟
         for uid, union in unions.items():
-            if len(union) <= self.member_tolerance:
+            if len(union) <= 3:
                 for cid in union:
                     self.his_client_unions[cid].pop(uid)
                     client_selfish_list.append(cid)
+        print(client_selfish_list)
+
+        # 联盟人数恢复策略
+        # min_uid = list(sorted(unions.items(), key=lambda x: len(x[1]), reverse=False))[0][0]  # 按照字典的值-联盟长度逆序排序
+        # len_rest = len(client_selfish_list)
+        # while len_rest > min_union:
+        #     if len_rest - min_union >= min_union:
+        #         new_union = []
+        #         for i in range(min_union):
+        #             new_union.append(client_selfish_list.pop())
+        #         unions.add(new_union)  # 取出前5加入
+        #         len_rest -= min_union
+        #     else:
+        #         cid = client_selfish_list.pop()
+        #         unions[min_uid].append(cid)
+        #         min_uid = list(sorted(unions.items(), key=lambda x: len(x[1]), reverse=False))[0][0]
+        #         len_rest -= 1
 
         return client_selfish_list
 
