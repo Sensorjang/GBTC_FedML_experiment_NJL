@@ -1,6 +1,6 @@
 import logging
 import torch.nn as nn
-from fedml.model.cv.cnn import CNN_DropOut, CNN_WEB, CNN_OriginalFedAvg,  FashionMNIST_CNN
+from fedml.model.cv.cnn import CNN_DropOut, CNN_WEB, CNN_DropOut_For_Femnist,  FashionMNIST_CNN
 from fedml.model.cv.darts import genotypes
 from fedml.model.cv.darts.model import NetworkCIFAR
 from fedml.model.cv.darts.model_search import Network
@@ -35,9 +35,9 @@ def create(args, output_dim):
     elif model_name == "cnn" and args.dataset == "mnist":
         logging.info("CNN + MNIST")
         model = CNN_DropOut(False)
-    elif model_name == "cnn" and args.dataset == "femnist":
+    elif model_name == "cnn_for_femnist" and args.dataset == "femnist":
         logging.info("CNN + FederatedEMNIST")
-        model = CNN_DropOut(False)
+        model = CNN_DropOut_For_Femnist(False)
     elif model_name == "resnet18_gn" and args.dataset == "fed_cifar100":
         logging.info("ResNet18_GN + Federated_CIFAR100")
         model = resnet18()

@@ -21,13 +21,13 @@ data_args:
 #  fed_cifar100  resnet18_gn
 
 model_args:
-  model: "cnn"
+  model: "cnn_for_femnist"
 
 train_args:
   federated_optimizer: "FedGBTC"
   client_id_list: "[]"
-  client_num_in_total: 60
-  client_num_per_round: 40 # useless param
+  client_num_in_total: 50
+  client_num_per_round: 50 # useless param
   comm_round: 250
   epochs: 1
   batch_size: 10
