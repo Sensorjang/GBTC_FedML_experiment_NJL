@@ -102,7 +102,7 @@ class FedCSAPI(object):
             test_data_local_dict,
             class_num,
         ] = dataset
-        self.client_num_in_total = 50
+        self.client_num_in_total = args.client_num_in_total
         self.train_global = train_data_global
         self.test_global = test_data_global
         self.val_global = None
@@ -125,14 +125,14 @@ class FedCSAPI(object):
         logging.info("self.model_trainer = {}".format(self.model_trainer))
 
         self._setup_clients(
-            train_data_local_num_dict, train_data_local_dict, test_data_local_dict, self.model_trainer,
+            train_data_local_num_dict, train_data_local_dict, test_data_local_dict, copy.deepcopy(self.model_trainer),
         )
 
     def _setup_clients(
         self, train_data_local_num_dict, train_data_local_dict, test_data_local_dict, model_trainer,
     ):
         logging.info("############setup_clients (START)#############")
-        for client_idx in range(self.args.client_num_in_total):
+        for client_idx in range(self.client_num_in_total):
             c = Client(
                 client_idx,
                 train_data_local_dict[client_idx],
@@ -140,11 +140,11 @@ class FedCSAPI(object):
                 train_data_local_num_dict[client_idx],
                 self.args,
                 self.device,
-                model_trainer,
+                copy.deepcopy(model_trainer),
             )
             self.client_list.append(c)
         logging.info("############setup_clients (END)#############")
-    def create_trust_graph(self, value_range=(1, 10), distrust_probability=0.01):
+    def create_trust_graph(self, value_range=(0, 10), distrust_probability=0.01):
         """
         修改后的函数，以一定的概率生成表示完全不信任的负无穷值，并将对角线元素设置为0。
         :param value_range: 信任值的范围，为(min_value, max_value)
@@ -332,13 +332,13 @@ class FedCSAPI(object):
             # at last round
             train_acc, train_loss, test_acc, test_loss = 0, 0, 0, 0
             if round_idx == self.args.comm_round - 1:
-                train_acc, train_loss, test_acc, test_loss = self._local_test_on_all_clients(round_idx)
+                self._local_test_on_all_clients(round_idx)
             # per {frequency_of_the_test} round
             elif round_idx % self.args.frequency_of_the_test == 0:
                 if self.args.dataset.startswith("stackoverflow"):
                     self._local_test_on_validation_set(round_idx)
                 else:
-                    train_acc, train_loss, test_acc, test_loss = self._local_test_on_all_clients(round_idx)
+                    self._local_test_on_all_clients(round_idx)
 
             mlops.log_round_info(self.args.comm_round, round_idx)
             selfish_num = len(client_selfish_list)
