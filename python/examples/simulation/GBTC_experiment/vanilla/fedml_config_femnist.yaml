@@ -8,7 +8,7 @@ data_args:
   data_cache_dir: ~/fedml_data
   partition_method: "hetero"
   partition_alpha: 0.5
-  experiment_niid_level: 0.7
+  experiment_niid_level: 0
   #experiment_niid_level = 1 means that the data is niid
   #experiment_niid_level = 0 means that the data is iid
   #experiment_niid_level = (0,1) e.g. 0.7 means that the data is partially niid
@@ -21,7 +21,7 @@ data_args:
 #  fed_cifar100  resnet18_gn
 
 model_args:
-  model: "cnn"
+  model: "cnn_for_femnist"
 
 train_args:
   federated_optimizer: "FedAvg"

@@ -4,11 +4,11 @@ common_args:
   excel_save_path: "D:\\"
 
 data_args:
-  dataset: "fmnist"
+  dataset: "cifar10"
   data_cache_dir: ~/fedml_data
-  partition_method: "homo"
+  partition_method: "hetero"
   partition_alpha: 0.5
-  experiment_niid_level: 0
+  experiment_niid_level: 0.7
   #experiment_niid_level = 1 means that the data is niid
   #experiment_niid_level = 0 means that the data is iid
   #experiment_niid_level = (0,1) e.g. 0.7 means that the data is partially niid
@@ -21,13 +21,13 @@ data_args:
 #  fed_cifar100  resnet18_gn
 
 model_args:
-  model: "cnn_for_fmnist"
+  model: "cnn_web"
 
 train_args:
-  federated_optimizer: "FedCS"
+  federated_optimizer: "FedGBTC"
   client_id_list: "[]"
   client_num_in_total: 50
-  client_num_per_round: 30
+  client_num_per_round: 30 # useless param
   comm_round: 250
   epochs: 1
   batch_size: 10

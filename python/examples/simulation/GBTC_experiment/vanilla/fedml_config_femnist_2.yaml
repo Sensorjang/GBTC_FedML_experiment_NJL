@@ -4,11 +4,11 @@ common_args:
   excel_save_path: "D:\\"
 
 data_args:
-  dataset: "fmnist"
+  dataset: "femnist"
   data_cache_dir: ~/fedml_data
-  partition_method: "homo"
+  partition_method: "hetero"
   partition_alpha: 0.5
-  experiment_niid_level: 0
+  experiment_niid_level: 0.3
   #experiment_niid_level = 1 means that the data is niid
   #experiment_niid_level = 0 means that the data is iid
   #experiment_niid_level = (0,1) e.g. 0.7 means that the data is partially niid
@@ -21,12 +21,12 @@ data_args:
 #  fed_cifar100  resnet18_gn
 
 model_args:
-  model: "cnn_for_fmnist"
+  model: "cnn_for_femnist"
 
 train_args:
-  federated_optimizer: "FedCS"
+  federated_optimizer: "FedAvg"
   client_id_list: "[]"
-  client_num_in_total: 50
+  client_num_in_total: 60
   client_num_per_round: 30
   comm_round: 250
   epochs: 1
@@ -43,10 +43,6 @@ validation_args:
 device_args:
   using_gpu: false
   gpu_id: 0
-#
-#  worker_num: 4
-#  gpu_mapping_file: ./gpu_mapping.yaml
-#  gpu_mapping_key: mapping_default
 
 comm_args:
   backend: "sp"
