@@ -24,7 +24,7 @@ model_args:
   model: "cnn_for_femnist"
 
 train_args:
-  federated_optimizer: "FedGBTC"
+  federated_optimizer: "FedCS"
   client_id_list: "[]"
   client_num_in_total: 60
   client_num_per_round: 40 # useless param
