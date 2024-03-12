@@ -351,23 +351,23 @@ class FedCSAPI(object):
             #                     str(client_indexes),
             #                     str(client_selected_times)])
 
-            # 填充数据到工作表
-            for i in range(len(accuracy_list)):
-                # 轮次号，测试精度，测试损失，训练时间
-                round_num = i + 1  # 轮次号从1开始
-                accuracy = accuracy_list[i]
-                loss = loss_list[i]
-                train_time = train_time_list[i]
-                member_num = member_num_list[i]
-                selfish_num = selfish_num_list[i]
-                global_metrics_ws.append([round_num, accuracy, loss, train_time, member_num, selfish_num])
+        # 填充数据到工作表
+        for i in range(len(accuracy_list)):
+            # 轮次号，测试精度，测试损失，训练时间
+            round_num = i + 1  # 轮次号从1开始
+            accuracy = accuracy_list[i]
+            loss = loss_list[i]
+            train_time = train_time_list[i]
+            member_num = member_num_list[i]
+            selfish_num = selfish_num_list[i]
+            global_metrics_ws.append([round_num, accuracy, loss, train_time, member_num, selfish_num])
 
-            # 保存Excel文件到self.args.excel_save_path+文件名
-            wb.save(
-                self.args.excel_save_path + self.args.model + "_[" + self.args.dataset + "]_FedCS_training_results_NIID" + str(
-                    self.args.experiment_niid_level) + ".xlsx")
-            # 休眠一段时间，以便下一个循环开始前有一些时间
-            # time.sleep(interval)
+        # 保存Excel文件到self.args.excel_save_path+文件名
+        wb.save(
+            self.args.excel_save_path + self.args.model + "_[" + self.args.dataset + "]_FedCS_training_results_NIID" + str(
+                self.args.experiment_niid_level) + ".xlsx")
+        # 休眠一段时间，以便下一个循环开始前有一些时间
+        # time.sleep(interval)
 
         mlops.log_training_finished_status()
         mlops.log_aggregation_finished_status()
