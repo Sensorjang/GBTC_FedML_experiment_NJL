@@ -339,7 +339,7 @@ class FedAvgAPI(object):
                 if self.args.dataset.startswith("stackoverflow"):
                     self._local_test_on_validation_set(round_idx)
                 else:
-                    train_acc, train_loss, test_acc, test_loss = self._local_test_on_all_clients(round_idx)
+                    # train_acc, train_loss, test_acc, test_loss = self._local_test_on_all_clients(round_idx)
 
             mlops.log_round_info(self.args.comm_round, round_idx)
             # 记录联盟实时数据
