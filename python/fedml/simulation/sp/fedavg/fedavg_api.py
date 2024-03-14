@@ -333,13 +333,13 @@ class FedAvgAPI(object):
             # at last round
             train_acc, train_loss, test_acc, test_loss = 0, 0, 0, 0
             if round_idx == self.args.comm_round - 1:
-                train_acc, train_loss, test_acc, test_loss = self._local_test_on_all_clients(round_idx)
+                 self._local_test_on_all_clients(round_idx)
             # per {frequency_of_the_test} round
             elif round_idx % self.args.frequency_of_the_test == 0:
                 if self.args.dataset.startswith("stackoverflow"):
                     self._local_test_on_validation_set(round_idx)
                 else:
-                    # train_acc, train_loss, test_acc, test_loss = self._local_test_on_all_clients(round_idx)
+                    self._local_test_on_all_clients(round_idx)
 
             mlops.log_round_info(self.args.comm_round, round_idx)
             # 记录联盟实时数据
