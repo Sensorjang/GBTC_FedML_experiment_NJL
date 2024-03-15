@@ -4,11 +4,11 @@ common_args:
   excel_save_path: "D:\\"
 
 data_args:
-  dataset: "femnist"
+  dataset: "mnist"
   data_cache_dir: ~/fedml_data
   partition_method: "hetero"
   partition_alpha: 0.5
-  experiment_niid_level: 0
+  experiment_niid_level: 0.3
   #experiment_niid_level = 1 means that the data is niid
   #experiment_niid_level = 0 means that the data is iid
   #experiment_niid_level = (0,1) e.g. 0.7 means that the data is partially niid
@@ -21,7 +21,7 @@ data_args:
 #  fed_cifar100  resnet18_gn
 
 model_args:
-  model: "cnn_for_femnist"
+  model: "cnn"
 
 train_args:
   federated_optimizer: "FedAvg"
@@ -35,7 +35,7 @@ train_args:
   learning_rate: 0.03
   weight_decay: 0.001
   trust_threshold: 70   # the threshold of trust value
-  member_range: [ 5, 25 ] # .yaml is junk which not support type of tuple
+  member_range: [5, 25] # .yaml is junk which not support type of tuple
 
 validation_args:
   frequency_of_the_test: 5

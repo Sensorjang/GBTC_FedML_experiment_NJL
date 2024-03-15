@@ -26,8 +26,8 @@ model_args:
 train_args:
   federated_optimizer: "FedCS"
   client_id_list: "[]"
-  client_num_in_total: 60
-  client_num_per_round: 40 # useless param
+  client_num_in_total: 50
+  client_num_per_round: 30 # useless param
   comm_round: 250
   epochs: 1
   batch_size: 10
