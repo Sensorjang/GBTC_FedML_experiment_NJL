@@ -26,7 +26,7 @@ model_args:
 train_args:
   federated_optimizer: "FedAvg"
   client_id_list: "[]"
-  client_num_in_total: 25
+  client_num_in_total: 50
   client_num_per_round: 15
   comm_round: 250
   epochs: 1
@@ -34,6 +34,8 @@ train_args:
   client_optimizer: sgd
   learning_rate: 0.03
   weight_decay: 0.001
+  trust_threshold: 70   # the threshold of trust value
+  member_range: [ 5, 25 ] # .yaml is junk which not support type of tuple
 
 validation_args:
   frequency_of_the_test: 5
